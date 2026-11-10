@@ -25,7 +25,8 @@ import numpy as np
 
 from face_features import FaceDetector, FeatureExtractor, ensure_model
 from pulse import PulseEstimator
-from stress_model import LABELS, READABLE, BaselineScorer, PersonalModel, Recorder, Smoother, level, train
+from stress_model import (LABELS, READABLE, BaselineScorer, FocusScorer, PersonalModel, Recorder, Smoother,
+                           focus_level, level, train)
 
 HERE = Path(__file__).resolve().parent
 FACE_MODEL = HERE / "models" / "face_landmarker.task"
@@ -60,12 +61,15 @@ class StressApp:
                 self.scorer = BaselineScorer(args.calibration, args.sensitivity)
                 print(f"Calibrating for {args.calibration:.0f} s: relax and look at the screen like you normally do.")
             self.smoother = Smoother(args.smoothing)
+            self.focus_scorer = FocusScorer(args.calibration)
+            self.focus_smoother = Smoother(args.smoothing)
             if args.udp != "off":
                 self.udp = UdpSender(args.udp)
                 print(f"Sending stress values to udp://{args.udp}")
 
         self.t, self.face, self.feats = 0.0, None, None
         self.stress, self.reasons = None, {}
+        self.focus = None
         self.history = deque()
         self.fps, self.details = 0.0, False
 
@@ -117,6 +121,11 @@ class StressApp:
                 self.stress = self.smoother.update(t, value)
             else:
                 self.scorer.calibrate(t, self.feats)
+            if self.focus_scorer.ready:
+                fvalue, _ = self.focus_scorer.score(self.feats)
+                self.focus = self.focus_smoother.update(t, fvalue)
+            else:
+                self.focus_scorer.calibrate(t, self.feats)
         if self.stress is not None:
             self.history.append((t, self.stress))
             while t - self.history[0][0] > HISTORY_SECONDS:
@@ -138,8 +147,11 @@ class StressApp:
         return {
             "stress": None if self.stress is None else round(self.stress, 3),
             "level": None if self.stress is None else level(self.stress),
+            "focus": None if self.focus is None else round(self.focus, 3),
+            "focus_level": None if self.focus is None else focus_level(self.focus),
             "face": self.face is not None,
             "calibrating": not self.scorer.ready,
+            "focus_calibrating": not self.focus_scorer.ready,
             "heart_rate": number("heart_rate"),
             "blink_rate": number("blink_rate"),
             "time": round(self.t, 2),
