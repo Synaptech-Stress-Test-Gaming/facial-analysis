@@ -45,7 +45,7 @@ EXPRESSIONS = {
 # --- "Micro-tension" stress cues from fine mouth/jaw movements -----------------
 # Every threshold for the cues below lives in this one block: durations in
 # seconds, everything else a raw blendshape score (0-1).
-CUE_NAMES = ("teeth_bare",)       # grows as more cues are added
+CUE_NAMES = ("teeth_bare", "jaw_clench")  # grows as more cues are added
 CUE_PERSIST_SECONDS = 0.6         # a cue must stay elevated this long before it contributes
 CUE_ACTIVE_THRESHOLD = 0.15       # raw cue value above this counts as "elevated"
 SPEECH_WINDOW_SECONDS = 1.0       # recent window used to detect talking/chewing
@@ -90,13 +90,18 @@ class CueTracker:
                   "mouthLowerDownLeft": b("mouthLowerDownLeft"), "mouthLowerDownRight": b("mouthLowerDownRight"),
                   "mouthStretchLeft": b("mouthStretchLeft"), "mouthStretchRight": b("mouthStretchRight"),
                   "mouthSmileLeft": b("mouthSmileLeft"), "mouthSmileRight": b("mouthSmileRight"),
-                  "jawOpen": jaw_open}
+                  "jawOpen": jaw_open, "mouthPressLeft": b("mouthPressLeft"), "mouthPressRight": b("mouthPressRight"),
+                  "mouthShrugLower": b("mouthShrugLower"),
+                  "mouthRollLower": b("mouthRollLower"), "mouthRollUpper": b("mouthRollUpper")}
 
         raw = {
             "teeth_bare": float(np.mean([inputs["mouthUpperUpLeft"], inputs["mouthUpperUpRight"],
                                           inputs["mouthLowerDownLeft"], inputs["mouthLowerDownRight"],
                                           inputs["mouthStretchLeft"], inputs["mouthStretchRight"]])
                                  * (1 - smile)),
+            "jaw_clench": float((1 - jaw_open) * np.mean([inputs["mouthPressLeft"], inputs["mouthPressRight"],
+                                                           inputs["mouthShrugLower"],
+                                                           inputs["mouthRollLower"], inputs["mouthRollUpper"]])),
         }
 
         gated = dict.fromkeys(CUE_NAMES, 0.0)
