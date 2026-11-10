@@ -33,7 +33,7 @@ READABLE = {
     "lip_roll": "lips sucked in", "mouth_frown": "mouth corners down",
     "mouth_stretch": "stretched lips", "chin_raise": "raised chin", "jaw_open": "open mouth",
     "smile": "smiling", "blink_rate": "blink rate", "head_motion": "head movement",
-    "face_size": "leaning in", "heart_rate": "heart rate",
+    "face_size": "leaning in", "heart_rate": "heart rate", "teeth_bare": "bared teeth",
 }
 
 # How strongly each feature pushes the baseline score up (+) or down (-).
@@ -55,6 +55,7 @@ WEIGHTS = {
     "face_size": 0.2,
     "heart_rate": 0.3,
     "smile": -0.6,
+    "teeth_bare": 0.4,
 }
 # Smallest spread trusted when comparing with the baseline (blendshapes use 0.04),
 # so a very still calibration doesn't turn tiny changes into big ones.
