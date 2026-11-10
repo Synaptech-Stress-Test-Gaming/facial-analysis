@@ -44,12 +44,15 @@ EXPRESSIONS = {
 
 # --- "Micro-tension" stress cues from fine mouth/jaw movements -----------------
 # Every threshold for the cues below lives in this one block: durations in
-# seconds, everything else a raw blendshape score (0-1).
-CUE_NAMES = ("teeth_bare", "jaw_clench")  # grows as more cues are added
+# seconds, everything else a raw blendshape score (0-1). jaw_clench and
+# lip_bite both key off mouthRoll ("lips sucked in / bitten"), so
+# JAW_LIP_BITE_CAP stops that one shared signal from being counted twice.
+CUE_NAMES = ("teeth_bare", "jaw_clench", "lip_bite")  # grows as more cues are added
 CUE_PERSIST_SECONDS = 0.6         # a cue must stay elevated this long before it contributes
 CUE_ACTIVE_THRESHOLD = 0.15       # raw cue value above this counts as "elevated"
 SPEECH_WINDOW_SECONDS = 1.0       # recent window used to detect talking/chewing
 SPEECH_JAW_VAR_THRESHOLD = 0.01   # jawOpen variance above this = talking/chewing: suppress all cues
+JAW_LIP_BITE_CAP = 0.6            # cap on the combined jaw_clench + lip_bite signal (shared mouthRoll)
 
 FEATURE_NAMES = (*EXPRESSIONS, *CUE_NAMES, "blink_rate", "head_motion", "face_size", "heart_rate")
 
@@ -102,7 +105,12 @@ class CueTracker:
             "jaw_clench": float((1 - jaw_open) * np.mean([inputs["mouthPressLeft"], inputs["mouthPressRight"],
                                                            inputs["mouthShrugLower"],
                                                            inputs["mouthRollLower"], inputs["mouthRollUpper"]])),
+            "lip_bite": float(max(inputs["mouthRollLower"], inputs["mouthRollUpper"])
+                               * (1 - jaw_open) * (1 - smile)),
         }
+        if raw["jaw_clench"] + raw["lip_bite"] > JAW_LIP_BITE_CAP:  # same mouthRoll signal: don't double-count
+            raw["lip_bite"] = min(raw["lip_bite"], JAW_LIP_BITE_CAP)
+            raw["jaw_clench"] = max(JAW_LIP_BITE_CAP - raw["lip_bite"], 0.0)
 
         gated = dict.fromkeys(CUE_NAMES, 0.0)
         if speaking:
