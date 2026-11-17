@@ -41,10 +41,123 @@ EXPRESSIONS = {
     "jaw_open": ("jawOpen",),                                    # talking, yelling, surprise
     "smile": ("mouthSmileLeft", "mouthSmileRight"),              # AU12 smile
 }
-FEATURE_NAMES = (*EXPRESSIONS, "blink_rate", "head_motion", "face_size", "heart_rate")
+
+# --- "Micro-tension" stress cues from fine mouth/jaw movements -----------------
+# Every threshold for the cues below lives in this one block: durations in
+# seconds, everything else a raw blendshape score (0-1). jaw_clench and
+# lip_bite both key off mouthRoll ("lips sucked in / bitten"), so
+# JAW_LIP_BITE_CAP stops that one shared signal from being counted twice.
+CUE_NAMES = ("teeth_bare", "jaw_clench", "lip_bite")  # grows as more cues are added
+CUE_PERSIST_SECONDS = 0.6         # a cue must stay elevated this long before it contributes
+CUE_ACTIVE_THRESHOLD = 0.15       # raw cue value above this counts as "elevated"
+SPEECH_WINDOW_SECONDS = 1.0       # recent window used to detect talking/chewing
+SPEECH_JAW_VAR_THRESHOLD = 0.01   # jawOpen variance above this = talking/chewing: suppress all cues
+JAW_LIP_BITE_CAP = 0.6            # cap on the combined jaw_clench + lip_bite signal (shared mouthRoll)
+
+FEATURE_NAMES = (*EXPRESSIONS, *CUE_NAMES, "blink_rate", "head_motion", "face_size", "heart_rate",
+                  "gaze_x", "gaze_y")
+
+# Every raw MediaPipe blendshape actually read above (by EXPRESSIONS, the cues, or blink
+# tracking), for recordings that want the unprocessed signal, not just the derived features.
+RAW_BLENDSHAPE_NAMES = tuple(sorted(
+    {name for names in EXPRESSIONS.values() for name in names}
+    | {"mouthUpperUpLeft", "mouthUpperUpRight", "mouthLowerDownLeft", "mouthLowerDownRight"}
+    | {"eyeBlinkLeft", "eyeBlinkRight"}
+))
 
 # A few landmark indices of MediaPipe's 478-point face mesh.
 NOSE_TIP, FACE_LEFT_EDGE, FACE_RIGHT_EDGE = 1, 234, 454
+
+# Eye corners and iris center for gaze: outer/inner corners and upper/lower lids
+# bound the eye opening, iris is the pupil-tracking landmark MediaPipe adds on top
+# of the 468-point face mesh (indices 468-477).
+EYE_LEFT = {"outer": 33, "inner": 133, "upper": 159, "lower": 145, "iris": 468}
+EYE_RIGHT = {"outer": 263, "inner": 362, "upper": 386, "lower": 374, "iris": 473}
+
+BLINK_MAX_SECONDS = 0.5       # closures shorter than this are a normal blink
+LONG_BLINK_MAX_SECONDS = 1.0  # closures up to this are a "long blink"; past it, assume looking down
+
+
+def _gaze_offset(points: np.ndarray, eye: dict) -> tuple[float, float]:
+    """Iris position within one eye, as a fraction of eye width/height from center.
+
+    0 is centered; positive x is towards the outer corner, positive y is down.
+    """
+    outer, inner, upper, lower, iris = (points[eye[k]] for k in ("outer", "inner", "upper", "lower", "iris"))
+    width = max(abs(outer[0] - inner[0]), 1.0)
+    height = max(abs(lower[1] - upper[1]), 1.0)
+    dx = (iris[0] - (outer[0] + inner[0]) / 2) / width
+    dy = (iris[1] - (upper[1] + lower[1]) / 2) / height
+    return dx, dy
+
+
+class CueTracker:
+    """Computes the cues in CUE_NAMES from raw per-frame blendshapes.
+
+    Each cue only turns on after CUE_PERSIST_SECONDS of continuous elevation
+    (so a quick expression doesn't count), and all cues are suppressed while
+    jawOpen is varying fast enough to mean talking or chewing.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self._since = dict.fromkeys(CUE_NAMES)  # cue name -> t it became elevated, or None
+        self._jaw_history = deque()              # (t, jawOpen) over the last SPEECH_WINDOW_SECONDS
+        self.debug = {"inputs": {}, "raw": dict.fromkeys(CUE_NAMES, 0.0),
+                      "gated": dict.fromkeys(CUE_NAMES, 0.0), "speaking": False}
+
+    def update(self, t: float, blendshapes: dict) -> dict[str, float]:
+        def b(name):
+            return blendshapes.get(name, 0.0)
+
+        jaw_open = b("jawOpen")
+        self._jaw_history.append((t, jaw_open))
+        while self._jaw_history and t - self._jaw_history[0][0] > SPEECH_WINDOW_SECONDS:
+            self._jaw_history.popleft()
+        speaking = (len(self._jaw_history) >= 5
+                    and np.var([j for _, j in self._jaw_history]) > SPEECH_JAW_VAR_THRESHOLD)
+
+        smile = (b("mouthSmileLeft") + b("mouthSmileRight")) / 2
+        inputs = {"mouthUpperUpLeft": b("mouthUpperUpLeft"), "mouthUpperUpRight": b("mouthUpperUpRight"),
+                  "mouthLowerDownLeft": b("mouthLowerDownLeft"), "mouthLowerDownRight": b("mouthLowerDownRight"),
+                  "mouthStretchLeft": b("mouthStretchLeft"), "mouthStretchRight": b("mouthStretchRight"),
+                  "mouthSmileLeft": b("mouthSmileLeft"), "mouthSmileRight": b("mouthSmileRight"),
+                  "jawOpen": jaw_open, "mouthPressLeft": b("mouthPressLeft"), "mouthPressRight": b("mouthPressRight"),
+                  "mouthShrugLower": b("mouthShrugLower"),
+                  "mouthRollLower": b("mouthRollLower"), "mouthRollUpper": b("mouthRollUpper")}
+
+        raw = {
+            "teeth_bare": float(np.mean([inputs["mouthUpperUpLeft"], inputs["mouthUpperUpRight"],
+                                          inputs["mouthLowerDownLeft"], inputs["mouthLowerDownRight"],
+                                          inputs["mouthStretchLeft"], inputs["mouthStretchRight"]])
+                                 * (1 - smile)),
+            "jaw_clench": float((1 - jaw_open) * np.mean([inputs["mouthPressLeft"], inputs["mouthPressRight"],
+                                                           inputs["mouthShrugLower"],
+                                                           inputs["mouthRollLower"], inputs["mouthRollUpper"]])),
+            "lip_bite": float(max(inputs["mouthRollLower"], inputs["mouthRollUpper"])
+                               * (1 - jaw_open) * (1 - smile)),
+        }
+        if raw["jaw_clench"] + raw["lip_bite"] > JAW_LIP_BITE_CAP:  # same mouthRoll signal: don't double-count
+            raw["lip_bite"] = min(raw["lip_bite"], JAW_LIP_BITE_CAP)
+            raw["jaw_clench"] = max(JAW_LIP_BITE_CAP - raw["lip_bite"], 0.0)
+
+        gated = dict.fromkeys(CUE_NAMES, 0.0)
+        if speaking:
+            self._since = dict.fromkeys(CUE_NAMES)
+        else:
+            for name in CUE_NAMES:
+                if raw[name] > CUE_ACTIVE_THRESHOLD:
+                    if self._since[name] is None:
+                        self._since[name] = t
+                else:
+                    self._since[name] = None
+                if self._since[name] is not None and t - self._since[name] >= CUE_PERSIST_SECONDS:
+                    gated[name] = raw[name]
+
+        self.debug = {"inputs": inputs, "raw": raw, "gated": gated, "speaking": speaking}
+        return gated
 
 
 @dataclass
@@ -127,21 +240,28 @@ class FeatureExtractor:
         self.window = window
         self.blink_window = blink_window
         self.pulse = pulse
-        self._frames = deque()   # (t, expression vector, head speed, face size)
+        self.cues = CueTracker()
+        self._frames = deque()   # (t, expression vector, head speed, face size, cue vector, gaze vector)
         self._visible = deque()  # (t, seconds of visible face this frame adds)
-        self._blinks = deque()   # times of completed blinks
+        self._blinks = deque()      # times of completed (short) blinks
+        self._long_blinks = deque()  # times of completed long blinks (0.5-1.0 s closures)
         self._eyes_open = None   # resting eyeBlink score with open eyes (differs per person)
         self._closed_at = None   # start of the current eye closure
         self._prev = None        # (t, nose position) of the previous frame with a face
+        self._face_present = False
 
     def update(self, t: float, frame: np.ndarray, face: Face | None) -> None:
         self._forget_before(t)
+        self._face_present = face is not None
         if face is None:
             self._prev = self._closed_at = None
+            self.cues.reset()
             return
 
         expr = np.array([np.mean([face.blendshapes.get(n, 0.0) for n in names])
                          for names in EXPRESSIONS.values()])
+        cue_values = self.cues.update(t, face.blendshapes)
+        cues = np.array([cue_values[n] for n in CUE_NAMES])
         width = max(face.width, 1.0)
         nose = face.points[NOSE_TIP]
         speed = math.nan
@@ -151,7 +271,10 @@ class FeatureExtractor:
             speed = float(np.linalg.norm(nose - self._prev[1])) / width / dt
             self._visible.append((t, dt))
         self._prev = (t, nose)
-        self._frames.append((t, expr, speed, width / frame.shape[1]))
+        left_dx, left_dy = _gaze_offset(face.points, EYE_LEFT)
+        right_dx, right_dy = _gaze_offset(face.points, EYE_RIGHT)
+        gaze = np.array([(left_dx + right_dx) / 2, (left_dy + right_dy) / 2])
+        self._frames.append((t, expr, speed, width / frame.shape[1], cues, gaze))
 
         self._track_blinks(t, face)
         if self.pulse is not None:
@@ -163,13 +286,24 @@ class FeatureExtractor:
         if len(self._frames) < 5:
             return None
         feats = dict(zip(EXPRESSIONS, np.mean([f[1] for f in self._frames], axis=0).tolist()))
+        feats.update(zip(CUE_NAMES, np.mean([f[4] for f in self._frames], axis=0).tolist()))
+        if not self._face_present:  # no stale cues once the face is gone, even if old frames linger
+            for name in CUE_NAMES:
+                feats[name] = 0.0
         speeds = [f[2] for f in self._frames if not math.isnan(f[2])]
         feats["head_motion"] = float(np.mean(speeds)) if speeds else math.nan
         feats["face_size"] = float(np.mean([f[3] for f in self._frames]))
         seen = sum(dt for _, dt in self._visible)
         feats["blink_rate"] = 60.0 * len(self._blinks) / seen if seen >= 10 else math.nan
         feats["heart_rate"] = self.pulse.current(t) if self.pulse is not None else math.nan
+        gaze_x, gaze_y = np.mean([f[5] for f in self._frames], axis=0) if self._face_present else (math.nan, math.nan)
+        feats["gaze_x"], feats["gaze_y"] = float(gaze_x), float(gaze_y)
         return feats
+
+    def long_blink_count(self, t: float) -> int:
+        """Long (0.5-1.0 s) eye closures in the last `blink_window` seconds."""
+        self._forget_before(t)
+        return len(self._long_blinks)
 
     def _track_blinks(self, t: float, face: Face) -> None:
         score = (face.blendshapes.get("eyeBlinkLeft", 0.0) + face.blendshapes.get("eyeBlinkRight", 0.0)) / 2
@@ -182,15 +316,19 @@ class FeatureExtractor:
             else:
                 self._eyes_open += 0.05 * (score - self._eyes_open)
         elif score < closed_above - 0.12:
-            if t - self._closed_at < 0.5:  # longer closures are not blinks
+            duration = t - self._closed_at
+            if duration < BLINK_MAX_SECONDS:
                 self._blinks.append(t)
+            elif duration < LONG_BLINK_MAX_SECONDS:
+                self._long_blinks.append(t)
             self._closed_at = None
-        elif t - self._closed_at > 1.0:  # "closed" for long: probably looking down, re-learn
+        elif t - self._closed_at > LONG_BLINK_MAX_SECONDS:  # "closed" for long: probably looking down, re-learn
             self._eyes_open, self._closed_at = score, None
 
     def _forget_before(self, t: float) -> None:
         for queue, horizon in ((self._frames, self.window), (self._visible, self.blink_window)):
             while queue and t - queue[0][0] > horizon:
                 queue.popleft()
-        while self._blinks and t - self._blinks[0] > self.blink_window:
-            self._blinks.popleft()
+        for queue in (self._blinks, self._long_blinks):
+            while queue and t - queue[0] > self.blink_window:
+                queue.popleft()

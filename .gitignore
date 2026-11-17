@@ -2,3 +2,6 @@ __pycache__/
 .venv/
 models/
 recordings/
+venv/
+debug_frame.jpg
+.DS_Store
