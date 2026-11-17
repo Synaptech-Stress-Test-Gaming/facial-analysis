@@ -165,6 +165,8 @@ class Face:
     points: np.ndarray  # (478, 2) landmark positions in pixels
     blendshapes: dict   # blendshape name -> score between 0 and 1
 
+    pose: tuple[float, float, float] | None = None
+
     @property
     def width(self) -> float:
         return float(np.linalg.norm(self.points[FACE_RIGHT_EDGE] - self.points[FACE_LEFT_EDGE]))
@@ -196,6 +198,7 @@ class FaceDetector:
             running_mode=vision.RunningMode.VIDEO,
             num_faces=1,
             output_face_blendshapes=True,
+            output_facial_transformation_matrixes=True,
         )
         self._landmarker = vision.FaceLandmarker.create_from_options(options)
         self._last_ms = -1
@@ -211,7 +214,13 @@ class FaceDetector:
         h, w = frame_bgr.shape[:2]
         points = np.array([(p.x * w, p.y * h) for p in result.face_landmarks[0]], dtype=np.float32)
         blendshapes = {c.category_name: c.score for c in result.face_blendshapes[0]}
-        return Face(points, blendshapes)
+        matrices = result.facial_transformation_matrixes
+        pose = None
+        if len(matrices) and np.isfinite(matrices[0]).all():
+            angles = cv2.RQDecomp3x3(np.asarray(matrices[0][:3, :3], dtype=np.float64))[0]
+            if all(math.isfinite(angle) for angle in angles):
+                pose = tuple(map(float, angles))
+        return Face(points, blendshapes, pose)
 
     def close(self) -> None:
         self._landmarker.close()
