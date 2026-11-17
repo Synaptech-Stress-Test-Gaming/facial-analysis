@@ -36,3 +36,12 @@ python stress_cam.py train
 ```
 
 These commands retain the historical feature columns, recordings and model format. Recordings are CSVs of derived features. Existing labels are supplied by the person running the session. `train` performs session-level cross-validation when enough sessions are available. Live mode uses the saved model when present. Use `--baseline` to select the historical calibration heuristic. Treat the legacy score as an experimental game input. The new scientific stress score is unavailable.
+
+## Muse 2 EEG viewer
+
+```sh
+python muse_eeg.py
+python muse_eeg.py --synthetic
+```
+
+`muse_eeg.py` connects to a Muse 2 over Bluetooth through BrainFlow and shows the four electrodes (TP9, AF7, AF8, TP10) filtered to 1–45 Hz, the skin contact of each, the share of power in each brainwave band over the last 2 s, and an EEG stress index: beta / (alpha + theta) compared with a 20 s relaxed calibration. Close the Muse app on your phone first, because the headband talks to one device at a time. `--name Muse-XXXX` picks one headband and `--synthetic` uses BrainFlow's simulated board. Values go to UDP `127.0.0.1:5006` with `"source": "eeg"`.
