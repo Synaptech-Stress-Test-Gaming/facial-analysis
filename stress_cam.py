@@ -20,6 +20,7 @@ import sys
 import time
 from collections import deque
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -80,7 +81,7 @@ class StressApp:
                 print(f"Recording labeled session to {self.label_recorder.path.name} "
                       f"(keys: {', '.join(f'{chr(k)}={v}' for k, v in sorted(LABEL_KEYS.items()))})")
 
-        self.t, self.frame_id, self.t_capture, self.face, self.feats = 0.0, 0, 0.0, None, None
+        self.t, self.frame_id, self.frame, self.t_capture, self.face, self.feats = 0.0, 0, None, 0.0, None, None
         self.stress, self.reasons = None, {}
         self.focus = None
         self.label = "none"
@@ -88,13 +89,20 @@ class StressApp:
         self.fps, self.details = 0.0, False
         self.test_cues = getattr(args, "test_cues", False)
 
-    def run(self) -> None:
+    def run(self, on_step: Callable[[], None] | None = None) -> None:
+        """Runs until the window is closed / max-seconds is reached / recording finishes.
+
+        on_step, if given, runs right after every step() (e.g. server.py uses it to drain
+        its command queue and publish the latest metrics, from the same thread as step()).
+        """
         if not self.args.no_window:
             cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
         last_frame, last_print, last_cue_print = None, -math.inf, -math.inf
         try:
             for t, frame_id, frame, t_capture in frames(self.args):
                 self.step(t, frame_id, frame, t_capture)
+                if on_step:
+                    on_step()
                 now = time.perf_counter()
                 if last_frame is not None:
                     rate = 1.0 / max(now - last_frame, 1e-6)
@@ -130,7 +138,7 @@ class StressApp:
                     print("Nothing was recorded (no frames were captured).")
 
     def step(self, t: float, frame_id: int, frame: np.ndarray, t_capture: float) -> None:
-        self.t, self.frame_id, self.t_capture = t, frame_id, t_capture
+        self.t, self.frame_id, self.frame, self.t_capture = t, frame_id, frame, t_capture
         self.face = self.detector.detect(frame, t)
         self.extractor.update(t, frame, self.face)
         self.feats = self.extractor.features(t)
