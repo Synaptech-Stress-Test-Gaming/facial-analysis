@@ -23,9 +23,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from face_features import FaceDetector, FeatureExtractor, ensure_model
+from face_features import CUE_NAMES, FaceDetector, FeatureExtractor, ensure_model
 from pulse import PulseEstimator
-from stress_model import LABELS, READABLE, BaselineScorer, PersonalModel, Recorder, Smoother, level, train
+from stress_model import (LABELS, READABLE, BaselineScorer, FocusScorer, PersonalModel, Recorder, Smoother,
+                           focus_level, level, train)
 
 HERE = Path(__file__).resolve().parent
 FACE_MODEL = HERE / "models" / "face_landmarker.task"
@@ -60,19 +61,23 @@ class StressApp:
                 self.scorer = BaselineScorer(args.calibration, args.sensitivity)
                 print(f"Calibrating for {args.calibration:.0f} s: relax and look at the screen like you normally do.")
             self.smoother = Smoother(args.smoothing)
+            self.focus_scorer = FocusScorer(args.calibration)
+            self.focus_smoother = Smoother(args.smoothing)
             if args.udp != "off":
                 self.udp = UdpSender(args.udp)
                 print(f"Sending stress values to udp://{args.udp}")
 
         self.t, self.face, self.feats = 0.0, None, None
         self.stress, self.reasons = None, {}
+        self.focus = None
         self.history = deque()
         self.fps, self.details = 0.0, False
+        self.test_cues = getattr(args, "test_cues", False)
 
     def run(self) -> None:
         if not self.args.no_window:
             cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-        last_frame, last_print = None, -math.inf
+        last_frame, last_print, last_cue_print = None, -math.inf, -math.inf
         try:
             for t, frame in frames(self.args):
                 self.step(t, frame)
@@ -81,6 +86,9 @@ class StressApp:
                     rate = 1.0 / max(now - last_frame, 1e-6)
                     self.fps = 0.9 * self.fps + 0.1 * rate if self.fps else rate
                 last_frame = now
+                if self.test_cues and not self.recorder and t - last_cue_print >= 0.2:
+                    last_cue_print = t
+                    print(self.cue_debug_line())
                 if self.args.no_window:
                     if t - last_print >= 1.0:
                         last_print = t
@@ -117,6 +125,11 @@ class StressApp:
                 self.stress = self.smoother.update(t, value)
             else:
                 self.scorer.calibrate(t, self.feats)
+            if self.focus_scorer.ready:
+                fvalue, _ = self.focus_scorer.score(self.feats)
+                self.focus = self.focus_smoother.update(t, fvalue)
+            else:
+                self.focus_scorer.calibrate(t, self.feats)
         if self.stress is not None:
             self.history.append((t, self.stress))
             while t - self.history[0][0] > HISTORY_SECONDS:
@@ -138,16 +151,30 @@ class StressApp:
         return {
             "stress": None if self.stress is None else round(self.stress, 3),
             "level": None if self.stress is None else level(self.stress),
+            "focus": None if self.focus is None else round(self.focus, 3),
+            "focus_level": None if self.focus is None else focus_level(self.focus),
             "face": self.face is not None,
             "calibrating": not self.scorer.ready,
+            "focus_calibrating": not self.focus_scorer.ready,
             "heart_rate": number("heart_rate"),
             "blink_rate": number("blink_rate"),
+            **{name: number(name) for name in CUE_NAMES},
             "time": round(self.t, 2),
         }
 
     def top_reasons(self, n: int = 2) -> list[str]:
         ranked = sorted(self.reasons.items(), key=lambda kv: -kv[1])
         return [READABLE[name] for name, push in ranked[:n] if push > 0.25]
+
+    def cue_debug_line(self) -> str:
+        """One console line for --test-cues: raw blendshape inputs and computed cue values."""
+        head = f"[{self.t:6.1f}s]" + ("" if self.face else " (no face)")
+        if not self.face:
+            return head
+        dbg = self.extractor.cues.debug
+        inputs = " ".join(f"{k}={v:.2f}" for k, v in dbg["inputs"].items())
+        cues = " ".join(f"{name} raw={dbg['raw'][name]:.2f} on={dbg['gated'][name]:.2f}" for name in CUE_NAMES)
+        return f"{head} {inputs} | {cues}" + (" SPEAKING/CHEWING" if dbg["speaking"] else "")
 
     def status(self) -> str:
         """One console line, printed every second with --no-window."""
@@ -359,6 +386,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     live.add_argument("--sensitivity", type=float, default=0.4, help="how strongly the baseline score reacts (default 0.4)")
     live.add_argument("--smoothing", type=float, default=1.0, help="seconds of smoothing on the output (default 1)")
     live.add_argument("--udp", default="127.0.0.1:5005", help="host:port to send stress values to, or 'off'")
+    live.add_argument("--test-cues", action="store_true",
+                       help="print raw blendshapes and the computed stress-cue values live, for tuning expressions")
     record = commands.add_parser("record", parents=[common], help="record a labeled session for training")
     record.add_argument("label", choices=LABELS)
     record.add_argument("--seconds", type=float, default=120.0, help="length of the recording (default 120)")
