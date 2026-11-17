@@ -249,7 +249,10 @@ class Recorder:
 def _read_session(path: Path) -> tuple[str, np.ndarray] | None:
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
-    if not rows or rows[0]["label"] not in LABELS:
+    # Recordings from `stress_cam.py run --record` live in the same folder and reuse some of
+    # the same label names (calm/stressed), but have a different schema; skip those instead
+    # of silently feeding mostly-missing columns into training.
+    if not rows or rows[0]["label"] not in LABELS or not set(FEATURE_NAMES) <= rows[0].keys():
         return None
     x = np.array([[float(r[k]) if r.get(k) else math.nan for k in FEATURE_NAMES] for r in rows])
     return rows[0]["label"], x

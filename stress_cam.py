@@ -12,6 +12,7 @@ default) so a game in any engine can react to it; see game_receiver_example.py.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import socket
@@ -22,8 +23,10 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pylsl
 
-from face_features import CUE_NAMES, FaceDetector, FeatureExtractor, ensure_model
+import clock
+from face_features import CUE_NAMES, RAW_BLENDSHAPE_NAMES, FaceDetector, FeatureExtractor, ensure_model
 from pulse import PulseEstimator
 from stress_model import (LABELS, READABLE, BaselineScorer, FocusScorer, PersonalModel, Recorder, Smoother,
                            focus_level, level, train)
@@ -36,6 +39,7 @@ RECORDINGS = HERE / "recordings"
 WINDOW = "Stress detector"
 RECORD_WARMUP = 10.0  # seconds before a recording starts, so blink rate and pulse have data
 HISTORY_SECONDS = 60
+LABEL_KEYS = {ord("0"): "none", ord("1"): "calm", ord("2"): "stressed", ord("3"): "focused", ord("4"): "distracted"}
 
 # OpenCV colors are (blue, green, red).
 GREEN, YELLOW, RED = (90, 200, 90), (0, 200, 255), (60, 60, 235)
@@ -49,7 +53,7 @@ class StressApp:
         self.detector = FaceDetector(ensure_model(FACE_MODEL))
         self.pulse = None if args.no_pulse else PulseEstimator()
         self.extractor = FeatureExtractor(pulse=self.pulse)
-        self.recorder = self.scorer = self.udp = None
+        self.recorder = self.scorer = self.udp = self.label_recorder = self.lsl_outlet = None
         if args.command == "record":
             self.recorder = Recorder(RECORDINGS, args.label)
             print(f"Recording '{args.label}' for {args.seconds:.0f} s after a {RECORD_WARMUP:.0f} s warm-up.")
@@ -66,10 +70,16 @@ class StressApp:
             if args.udp != "off":
                 self.udp = UdpSender(args.udp)
                 print(f"Sending stress values to udp://{args.udp}")
+            self.lsl_outlet = StressOutlet()
+            if getattr(args, "record", None):
+                self.label_recorder = LabelRecorder(RECORDINGS, args.record)
+                print(f"Recording labeled session to {self.label_recorder.path.name} "
+                      f"(keys: {', '.join(f'{chr(k)}={v}' for k, v in sorted(LABEL_KEYS.items()))})")
 
-        self.t, self.face, self.feats = 0.0, None, None
+        self.t, self.frame_id, self.t_capture, self.face, self.feats = 0.0, 0, 0.0, None, None
         self.stress, self.reasons = None, {}
         self.focus = None
+        self.label = "none"
         self.history = deque()
         self.fps, self.details = 0.0, False
         self.test_cues = getattr(args, "test_cues", False)
@@ -79,8 +89,8 @@ class StressApp:
             cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
         last_frame, last_print, last_cue_print = None, -math.inf, -math.inf
         try:
-            for t, frame in frames(self.args):
-                self.step(t, frame)
+            for t, frame_id, frame, t_capture in frames(self.args):
+                self.step(t, frame_id, frame, t_capture)
                 now = time.perf_counter()
                 if last_frame is not None:
                     rate = 1.0 / max(now - last_frame, 1e-6)
@@ -108,9 +118,15 @@ class StressApp:
                     print(f"Saved {self.recorder.rows} samples to {self.recorder.path}")
                 else:
                     print("Nothing was recorded (no face seen after the warm-up).")
+            if self.label_recorder:
+                self.label_recorder.close()
+                if self.label_recorder.rows:
+                    print(f"Saved {self.label_recorder.rows} rows to {self.label_recorder.path}")
+                else:
+                    print("Nothing was recorded (no frames were captured).")
 
-    def step(self, t: float, frame: np.ndarray) -> None:
-        self.t = t
+    def step(self, t: float, frame_id: int, frame: np.ndarray, t_capture: float) -> None:
+        self.t, self.frame_id, self.t_capture = t, frame_id, t_capture
         self.face = self.detector.detect(frame, t)
         self.extractor.update(t, frame, self.face)
         self.feats = self.extractor.features(t)
@@ -134,6 +150,10 @@ class StressApp:
             self.history.append((t, self.stress))
             while t - self.history[0][0] > HISTORY_SECONDS:
                 self.history.popleft()
+        if self.label_recorder:
+            self.label_recorder.write(t_capture, frame_id, self.face, self.stress, self.focus, self.feats, self.label)
+        if self.lsl_outlet:
+            self.lsl_outlet.push(t_capture, self.stress, self.focus)
         if self.udp:
             self.udp.send(t, self.message())
 
@@ -160,6 +180,8 @@ class StressApp:
             "blink_rate": number("blink_rate"),
             **{name: number(name) for name in CUE_NAMES},
             "time": round(self.t, 2),
+            "t_capture": round(self.t_capture, 6),
+            "frame_id": self.frame_id,
         }
 
     def top_reasons(self, n: int = 2) -> list[str]:
@@ -188,8 +210,29 @@ class StressApp:
         if self.stress is None:
             return f"{head} waiting for a face"
         m = {k: "--" if v is None else v for k, v in self.message().items()}
+        label = f" label {self.label}" if self.label_recorder else ""
         return (f"{head} stress {self.stress:.2f} {m['level']:<8} heart {m['heart_rate']} bpm, "
-                f"blinks {m['blink_rate']}/min, why: {', '.join(self.top_reasons()) or '-'}")
+                f"blinks {m['blink_rate']}/min, why: {', '.join(self.top_reasons()) or '-'}{label}")
+
+    # ---- control (also used by server.py, from the same thread as step()) ----
+
+    def set_label(self, label: str, t: float | None = None) -> None:
+        if label != self.label:
+            print(f"[{(self.t if t is None else t):6.1f}s] label -> {label}")
+            self.label = label
+
+    def start_recording(self, name: str) -> None:
+        if self.label_recorder:
+            self.label_recorder.close()
+        self.label_recorder = LabelRecorder(RECORDINGS, name)
+
+    def stop_recording(self) -> dict:
+        if not self.label_recorder:
+            return {"rows": 0, "path": None}
+        path, rows = self.label_recorder.path, self.label_recorder.rows
+        self.label_recorder.close()
+        self.label_recorder = None
+        return {"rows": rows, "path": None if rows == 0 else str(path)}
 
     # ---- window ---------------------------------------------------------------
 
@@ -207,6 +250,8 @@ class StressApp:
             self.smoother.reset()
             self.stress, self.reasons = None, {}
             self.history.clear()
+        if key in LABEL_KEYS:
+            self.set_label(LABEL_KEYS[key])
         return True
 
     def draw(self, img: np.ndarray) -> None:
@@ -221,7 +266,7 @@ class StressApp:
         else:
             put(img, "No face - look at the camera", (w // 2 - 160, h // 2), 0.7, YELLOW, 2)
 
-        shade(img, 0, 0, 270, 136)
+        shade(img, 0, 0, 270, 136 + (24 if self.label_recorder else 0))
         if self.recorder:
             self._draw_recording(img)
         elif not self.scorer.ready:
@@ -238,10 +283,13 @@ class StressApp:
         blinks = self.feats["blink_rate"] if self.feats else math.nan
         put(img, f"heart {'--' if math.isnan(hr) else f'{hr:.0f}'} bpm (beta)   "
                  f"blinks {'--' if math.isnan(blinks) else f'{blinks:.0f}'}/min", (12, 126), 0.42, GRAY)
+        if self.label_recorder:
+            put(img, f"LABEL: {self.label.upper()}", (12, 150), 0.55, YELLOW, 2)
 
         mode = "recording" if self.recorder else self.scorer.name
         put_right(img, f"{mode} | {self.fps:.0f} fps", 20)
         keys = "q quit  d details" + ("  c recalibrate" if isinstance(self.scorer, BaselineScorer) else "")
+        keys += "  0-4 label" if self.label_recorder else ""
         put_right(img, keys, 40)
         if self.details:
             self._draw_details(img)
@@ -297,14 +345,84 @@ class UdpSender:
         if t - self._last < self.interval:
             return
         self._last = t
+        message = {**message, "t_emit": round(clock.now(), 6)}  # stamped now, not at frame capture
         try:
             self._sock.sendto(json.dumps(message).encode(), self.target)
         except OSError:
             pass  # nobody is listening yet; that's fine
 
 
+class StressOutlet:
+    """Publishes stress and focus as an LSL stream, so LabRecorder can record them
+    alongside the Muse 2 EEG (same clock.now() timestamps, see clock.py).
+    """
+
+    def __init__(self):
+        info = pylsl.StreamInfo(name="WebcamStress", type="Stress", channel_count=2,
+                                 nominal_srate=pylsl.IRREGULAR_RATE, channel_format="float32",
+                                 source_id="facial-analysis-stress-cam")
+        channels = info.desc().append_child("channels")
+        for label in ("stress", "focus"):
+            ch = channels.append_child("channel")
+            ch.append_child_value("label", label)
+            ch.append_child_value("unit", "normalized")
+            ch.append_child_value("type", "Stress")
+        self._outlet = pylsl.StreamOutlet(info)
+
+    def push(self, t_capture: float, stress: float | None, focus: float | None) -> None:
+        s = math.nan if stress is None else stress
+        f = math.nan if focus is None else focus
+        self._outlet.push_sample([s, f], timestamp=t_capture)
+
+
+class LabelRecorder:
+    """Per-frame CSV for syncing with an EEG recording in LabRecorder: one row per frame,
+    an LSL timestamp, every stress cue, the raw blendshapes behind them, and a label the
+    caller sets live (StressApp.label, via the number keys or the server's /label/{name}).
+    A frame with no face gets blank cue and score columns rather than the last known
+    values, so a look-away doesn't look like data.
+    """
+
+    def __init__(self, folder: Path, name: str):
+        folder.mkdir(parents=True, exist_ok=True)
+        self.path = folder / f"{name}_{time.strftime('%Y%m%d-%H%M%S')}.csv"
+        self.rows = 0
+        self._file = open(self.path, "w", newline="")
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(["t_capture", "frame_id", "face_found", "stress", "focus",
+                                *CUE_NAMES, *RAW_BLENDSHAPE_NAMES, "label"])
+
+    def write(self, t_capture: float, frame_id: int, face, stress: float | None, focus: float | None,
+              feats: dict | None, label: str) -> None:
+        face_found = face is not None
+
+        def num(x) -> str:
+            return "" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:.5g}"
+
+        if face_found:
+            cues = [num(feats[name]) for name in CUE_NAMES] if feats else ["" for _ in CUE_NAMES]
+            raw = [num(face.blendshapes.get(name, math.nan)) for name in RAW_BLENDSHAPE_NAMES]
+        else:
+            cues = ["" for _ in CUE_NAMES]
+            raw = ["" for _ in RAW_BLENDSHAPE_NAMES]
+        self._writer.writerow([f"{t_capture:.6f}", frame_id, int(face_found), num(stress), num(focus),
+                                *cues, *raw, label])
+        self.rows += 1
+
+    def close(self) -> None:
+        self._file.close()
+        if self.rows == 0:
+            self.path.unlink()
+
+
 def frames(args: argparse.Namespace):
-    """Yields (seconds since start, BGR image) from the webcam or a video file."""
+    """Yields (seconds since start, frame_id, BGR image, t_capture) from the webcam or a video file.
+
+    t_capture is stamped the instant the frame is grabbed, on the shared LSL clock
+    (clock.now()), so it lines up with anything else recorded on that clock (e.g. the Muse 2
+    EEG in LabRecorder). `t` stays the pre-existing elapsed-seconds-since-start value that the
+    rest of the app (calibration, smoothing, history) depends on.
+    """
     if args.video:
         cap = cv2.VideoCapture(args.video)
         if not cap.isOpened():
@@ -312,10 +430,11 @@ def frames(args: argparse.Namespace):
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     else:
         cap = open_camera(args.camera)
-    start, index, failures = time.monotonic(), 0, 0
+    start, index, failures = clock.now(), 0, 0
     try:
         while True:
             ok, frame = cap.read()
+            t_capture = clock.now()
             if not ok:
                 if args.video:
                     return
@@ -326,10 +445,10 @@ def frames(args: argparse.Namespace):
                 continue
             failures = 0
             if args.video:
-                yield index / fps, frame  # video time, so results don't depend on processing speed
-                index += 1
+                yield index / fps, index, frame, t_capture  # video time, so results don't depend on processing speed
             else:
-                yield time.monotonic() - start, cv2.flip(frame, 1)  # mirrored, like a selfie
+                yield t_capture - start, index, cv2.flip(frame, 1), t_capture  # mirrored, like a selfie
+            index += 1
     finally:
         cap.release()
 
@@ -388,6 +507,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     live.add_argument("--udp", default="127.0.0.1:5005", help="host:port to send stress values to, or 'off'")
     live.add_argument("--test-cues", action="store_true",
                        help="print raw blendshapes and the computed stress-cue values live, for tuning expressions")
+    live.add_argument("--record", metavar="NAME",
+                       help="also write a per-frame CSV to recordings/<name>_<timestamp>.csv with LSL "
+                            "timestamps and a label you set live with the 0-4 keys, for syncing with an EEG "
+                            "recording in LabRecorder")
     record = commands.add_parser("record", parents=[common], help="record a labeled session for training")
     record.add_argument("label", choices=LABELS)
     record.add_argument("--seconds", type=float, default=120.0, help="length of the recording (default 120)")

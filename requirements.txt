@@ -2,3 +2,4 @@ mediapipe>=0.10.14   # face landmarks + blendshapes (also installs OpenCV)
 scikit-learn>=1.2    # personal model
 scipy                # heart-rate filter
 numpy
+pylsl                # shared clock + StreamOutlet, so recordings line up with the Muse 2 EEG

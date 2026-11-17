@@ -56,6 +56,14 @@ JAW_LIP_BITE_CAP = 0.6            # cap on the combined jaw_clench + lip_bite si
 
 FEATURE_NAMES = (*EXPRESSIONS, *CUE_NAMES, "blink_rate", "head_motion", "face_size", "heart_rate")
 
+# Every raw MediaPipe blendshape actually read above (by EXPRESSIONS, the cues, or blink
+# tracking), for recordings that want the unprocessed signal, not just the derived features.
+RAW_BLENDSHAPE_NAMES = tuple(sorted(
+    {name for names in EXPRESSIONS.values() for name in names}
+    | {"mouthUpperUpLeft", "mouthUpperUpRight", "mouthLowerDownLeft", "mouthLowerDownRight"}
+    | {"eyeBlinkLeft", "eyeBlinkRight"}
+))
+
 # A few landmark indices of MediaPipe's 478-point face mesh.
 NOSE_TIP, FACE_LEFT_EDGE, FACE_RIGHT_EDGE = 1, 234, 454
 
