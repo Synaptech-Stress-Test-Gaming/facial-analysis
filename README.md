@@ -13,7 +13,7 @@ python -m pip install -r requirements.txt
 python stress_cam.py
 ```
 
-On Windows, use `.venv\Scripts\activate` after creating the environment. OpenCV needs permission to use the camera from the terminal or application running Python. MediaPipe downloads its face model on first run if `models/face_landmarker.task` is absent.
+On Windows, use `.venv\Scripts\activate` after creating the environment. OpenCV needs permission to use the camera from the terminal or application running Python. `--camera 1` picks another webcam, and setting the environment variable `STRESS_CAMERA=1` makes that the default (on a Mac, camera 0 can be a nearby iPhone through Continuity Camera). MediaPipe downloads its face model on first run if `models/face_landmarker.task` is absent.
 
 Look at the center of the playing area while eye calibration collects open-eye samples. The separate legacy stress baseline runs for 20 seconds by default. Press **c** to recalibrate, **d** for details, or **q** to quit. For playback or game development:
 

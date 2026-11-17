@@ -15,6 +15,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import socket
 import sys
 import time
@@ -683,7 +684,8 @@ def bar(img, x, y, width, fraction, color, height=12) -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--camera", type=int, default=0, help="webcam number (default 0)")
+    common.add_argument("--camera", type=int, default=int(os.environ.get("STRESS_CAMERA", 0)),
+                        help="webcam number (default 0, or the STRESS_CAMERA environment variable)")
     common.add_argument("--video", help="read a video file instead of the webcam")
     common.add_argument("--no-window", action="store_true", help="no camera window; print to the console")
     common.add_argument("--no-pulse", action="store_true", help="turn off the experimental heart-rate estimate")
