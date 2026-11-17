@@ -62,7 +62,8 @@ WEIGHTS = {
 }
 # Smallest spread trusted when comparing with the baseline (blendshapes use 0.04),
 # so a very still calibration doesn't turn tiny changes into big ones.
-MIN_STD = {"blink_rate": 3.0, "head_motion": 0.05, "face_size": 0.01, "heart_rate": 4.0}
+MIN_STD = {"blink_rate": 3.0, "head_motion": 0.05, "face_size": 0.01, "heart_rate": 4.0,
+           "gaze_x": 0.05, "gaze_y": 0.05}
 
 # Focus moves in both directions from baseline (unlike stress), so the sign here
 # encodes direction: fewer blinks or less fidgeting than your baseline raises focus,
@@ -73,6 +74,9 @@ FOCUS_WEIGHTS = {
     "head_motion": -0.4,
     "face_size": 0.3,
 }
+
+# Eye/gaze cues (for a server exposing them to a game, independently of stress/focus).
+EYE_FEATURES = ("gaze_x", "gaze_y", "eye_wide", "blink_rate")
 
 
 def level(stress: float) -> str:
@@ -181,6 +185,56 @@ class FocusScorer:
         return 1.0 / (1.0 + math.exp(-self.sensitivity * total)), reasons
 
 
+class EyeScorer:
+    """No training needed: compares gaze, eye-wideness and blink rate with your own baseline.
+
+    Calibrates on its own, independently of whichever stress scorer is active (gaze
+    baseline is unrelated to stress). Unlike BaselineScorer/FocusScorer, exposes signed
+    per-feature z-scores rather than one combined score: callers (e.g. off-screen-time
+    tracking) need the sign and magnitude of each cue separately, not a blended total.
+    """
+
+    name = "eye"
+
+    def __init__(self, calibration_seconds: float = 20.0):
+        self.calibration_seconds = calibration_seconds
+        self.restart()
+
+    def restart(self) -> None:
+        self.mean = self.std = None
+        self._samples, self._started = [], None
+
+    @property
+    def ready(self) -> bool:
+        return self.mean is not None
+
+    def progress(self, t: float) -> float:
+        return 0.0 if self._started is None else min((t - self._started) / self.calibration_seconds, 1.0)
+
+    def calibrate(self, t: float, feats: dict) -> None:
+        """Feed features while the player is relaxed; `ready` turns True when done."""
+        if self._started is None:
+            self._started = t
+        self._samples.append([feats[k] for k in EYE_FEATURES])
+        if t - self._started >= self.calibration_seconds and len(self._samples) >= 30:
+            data = np.array(self._samples)
+            with warnings.catch_warnings():  # features never measured stay NaN
+                warnings.simplefilter("ignore", RuntimeWarning)
+                self.mean = dict(zip(EYE_FEATURES, np.nanmean(data, axis=0)))
+                self.std = dict(zip(EYE_FEATURES, np.nanstd(data, axis=0)))
+
+    def deviations(self, feats: dict) -> dict:
+        """Signed z-score of each eye feature vs. your calibration baseline (NaN if unmeasured)."""
+        out = {}
+        for name in EYE_FEATURES:
+            x, mean = feats[name], self.mean[name]
+            if math.isnan(x) or math.isnan(mean):
+                out[name] = math.nan
+                continue
+            out[name] = (x - mean) / max(self.std[name], MIN_STD.get(name, 0.04))
+        return out
+
+
 class PersonalModel:
     """Your trained model (see `train`); needs no calibration."""
 
@@ -249,7 +303,10 @@ class Recorder:
 def _read_session(path: Path) -> tuple[str, np.ndarray] | None:
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
-    if not rows or rows[0]["label"] not in LABELS:
+    # Recordings from `stress_cam.py run --record` live in the same folder and reuse some of
+    # the same label names (calm/stressed), but have a different schema; skip those instead
+    # of silently feeding mostly-missing columns into training.
+    if not rows or rows[0]["label"] not in LABELS or not set(FEATURE_NAMES) <= rows[0].keys():
         return None
     x = np.array([[float(r[k]) if r.get(k) else math.nan for k in FEATURE_NAMES] for r in rows])
     return rows[0]["label"], x

@@ -98,6 +98,46 @@ the detector runs:
 python game_receiver_example.py
 ```
 
+## 4. Use it from a game over HTTP/WebSocket instead
+
+`server.py` wraps the same detector in a FastAPI server, for engines that would rather
+poll HTTP or hold a WebSocket open than listen on UDP. The capture/scoring loop runs on
+the main thread, exactly like `stress_cam.py` does (macOS wants the camera and any OpenCV
+window driven from the main thread); uvicorn runs in a background thread instead. The UDP
+output above keeps working unchanged alongside it.
+
+```bash
+pip install -r requirements.txt   # now also installs fastapi and uvicorn
+python server.py                  # http://127.0.0.1:8000, with the OpenCV window
+python server.py --headless       # no window, e.g. on a server box
+python server.py --port 9000 --camera 1 --video clip.mp4   # same options as stress_cam.py
+python server.py --debug-frame    # also save debug_frame.jpg + log its stats, once a second
+```
+
+This starts a single worker with no auto-reload (restart the process to pick up code
+changes). Endpoints:
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/docs` | GET | interactive Swagger UI |
+| `/health` | GET | `capture_running`, `face_found`, `last_frame_age_seconds`, `fps`, `last_error` |
+| `/metrics` | GET | the latest reading (same fields as the UDP JSON, plus `eye`, `label`, `recording`) |
+| `/ws` | WebSocket | the same payload as `/metrics`, pushed every 20 ms |
+| `/calibrate` | POST | restarts calibration (no-op if you're using your personal model) |
+| `/label/{name}` | POST | sets the current label, independently of recording |
+| `/record/start` | POST | starts a labeled CSV recording; JSON body `{"name": "session"}` |
+| `/record/stop` | POST | stops it and reports how many rows were written |
+
+`/health`'s `capture_running` is true only while frames are actually arriving (stale after
+2 s), not just while the thread object is alive; `last_error` holds the exception (e.g. a
+disconnected webcam) if the capture loop has stopped.
+
+`metrics.eye` adds gaze (`gaze_x`/`gaze_y`), `eye_wide` and `blink_rate`, each a z-score
+against your calibration baseline (see `EyeScorer` in `stress_model.py`), plus the raw
+`long_blink_count` and `off_screen_seconds` over a rolling 30 s window. All of it is
+`null`/`"ready": false` until calibration finishes, and the usual fields go `null` when
+`face` is `false`.
+
 ## How the score works
 
 | Signal | Comes from | Meaning |
@@ -130,10 +170,11 @@ outputs the probability that you are in your "stressed" state.
 | File | Purpose |
 |---|---|
 | `stress_cam.py` | the app: webcam loop, window, recording, UDP output |
-| `face_features.py` | MediaPipe face landmarks → features (expressions, blinks, head motion) |
+| `server.py` | FastAPI server around the same loop: `/metrics`, `/ws`, calibrate/label/record over HTTP |
+| `face_features.py` | MediaPipe face landmarks → features (expressions, blinks, head motion, gaze) |
 | `pulse.py` | experimental webcam heart rate |
 | `stress_model.py` | baseline score, personal ML model, training |
-| `game_receiver_example.py` | how a game reads the stress value |
+| `game_receiver_example.py` | how a game reads the stress value over UDP |
 
 `models/` and `recordings/` are created on first use and are git-ignored, because
 recordings are personal data.
