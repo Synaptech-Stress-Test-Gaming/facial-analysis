@@ -54,7 +54,8 @@ SPEECH_WINDOW_SECONDS = 1.0       # recent window used to detect talking/chewing
 SPEECH_JAW_VAR_THRESHOLD = 0.01   # jawOpen variance above this = talking/chewing: suppress all cues
 JAW_LIP_BITE_CAP = 0.6            # cap on the combined jaw_clench + lip_bite signal (shared mouthRoll)
 
-FEATURE_NAMES = (*EXPRESSIONS, *CUE_NAMES, "blink_rate", "head_motion", "face_size", "heart_rate")
+FEATURE_NAMES = (*EXPRESSIONS, *CUE_NAMES, "blink_rate", "head_motion", "face_size", "heart_rate",
+                  "gaze_x", "gaze_y")
 
 # Every raw MediaPipe blendshape actually read above (by EXPRESSIONS, the cues, or blink
 # tracking), for recordings that want the unprocessed signal, not just the derived features.
@@ -66,6 +67,28 @@ RAW_BLENDSHAPE_NAMES = tuple(sorted(
 
 # A few landmark indices of MediaPipe's 478-point face mesh.
 NOSE_TIP, FACE_LEFT_EDGE, FACE_RIGHT_EDGE = 1, 234, 454
+
+# Eye corners and iris center for gaze: outer/inner corners and upper/lower lids
+# bound the eye opening, iris is the pupil-tracking landmark MediaPipe adds on top
+# of the 468-point face mesh (indices 468-477).
+EYE_LEFT = {"outer": 33, "inner": 133, "upper": 159, "lower": 145, "iris": 468}
+EYE_RIGHT = {"outer": 263, "inner": 362, "upper": 386, "lower": 374, "iris": 473}
+
+BLINK_MAX_SECONDS = 0.5       # closures shorter than this are a normal blink
+LONG_BLINK_MAX_SECONDS = 1.0  # closures up to this are a "long blink"; past it, assume looking down
+
+
+def _gaze_offset(points: np.ndarray, eye: dict) -> tuple[float, float]:
+    """Iris position within one eye, as a fraction of eye width/height from center.
+
+    0 is centered; positive x is towards the outer corner, positive y is down.
+    """
+    outer, inner, upper, lower, iris = (points[eye[k]] for k in ("outer", "inner", "upper", "lower", "iris"))
+    width = max(abs(outer[0] - inner[0]), 1.0)
+    height = max(abs(lower[1] - upper[1]), 1.0)
+    dx = (iris[0] - (outer[0] + inner[0]) / 2) / width
+    dy = (iris[1] - (upper[1] + lower[1]) / 2) / height
+    return dx, dy
 
 
 class CueTracker:
@@ -209,9 +232,10 @@ class FeatureExtractor:
         self.blink_window = blink_window
         self.pulse = pulse
         self.cues = CueTracker()
-        self._frames = deque()   # (t, expression vector, head speed, face size, cue vector)
+        self._frames = deque()   # (t, expression vector, head speed, face size, cue vector, gaze vector)
         self._visible = deque()  # (t, seconds of visible face this frame adds)
-        self._blinks = deque()   # times of completed blinks
+        self._blinks = deque()      # times of completed (short) blinks
+        self._long_blinks = deque()  # times of completed long blinks (0.5-1.0 s closures)
         self._eyes_open = None   # resting eyeBlink score with open eyes (differs per person)
         self._closed_at = None   # start of the current eye closure
         self._prev = None        # (t, nose position) of the previous frame with a face
@@ -238,7 +262,10 @@ class FeatureExtractor:
             speed = float(np.linalg.norm(nose - self._prev[1])) / width / dt
             self._visible.append((t, dt))
         self._prev = (t, nose)
-        self._frames.append((t, expr, speed, width / frame.shape[1], cues))
+        left_dx, left_dy = _gaze_offset(face.points, EYE_LEFT)
+        right_dx, right_dy = _gaze_offset(face.points, EYE_RIGHT)
+        gaze = np.array([(left_dx + right_dx) / 2, (left_dy + right_dy) / 2])
+        self._frames.append((t, expr, speed, width / frame.shape[1], cues, gaze))
 
         self._track_blinks(t, face)
         if self.pulse is not None:
@@ -260,7 +287,14 @@ class FeatureExtractor:
         seen = sum(dt for _, dt in self._visible)
         feats["blink_rate"] = 60.0 * len(self._blinks) / seen if seen >= 10 else math.nan
         feats["heart_rate"] = self.pulse.current(t) if self.pulse is not None else math.nan
+        gaze_x, gaze_y = np.mean([f[5] for f in self._frames], axis=0) if self._face_present else (math.nan, math.nan)
+        feats["gaze_x"], feats["gaze_y"] = float(gaze_x), float(gaze_y)
         return feats
+
+    def long_blink_count(self, t: float) -> int:
+        """Long (0.5-1.0 s) eye closures in the last `blink_window` seconds."""
+        self._forget_before(t)
+        return len(self._long_blinks)
 
     def _track_blinks(self, t: float, face: Face) -> None:
         score = (face.blendshapes.get("eyeBlinkLeft", 0.0) + face.blendshapes.get("eyeBlinkRight", 0.0)) / 2
@@ -273,15 +307,19 @@ class FeatureExtractor:
             else:
                 self._eyes_open += 0.05 * (score - self._eyes_open)
         elif score < closed_above - 0.12:
-            if t - self._closed_at < 0.5:  # longer closures are not blinks
+            duration = t - self._closed_at
+            if duration < BLINK_MAX_SECONDS:
                 self._blinks.append(t)
+            elif duration < LONG_BLINK_MAX_SECONDS:
+                self._long_blinks.append(t)
             self._closed_at = None
-        elif t - self._closed_at > 1.0:  # "closed" for long: probably looking down, re-learn
+        elif t - self._closed_at > LONG_BLINK_MAX_SECONDS:  # "closed" for long: probably looking down, re-learn
             self._eyes_open, self._closed_at = score, None
 
     def _forget_before(self, t: float) -> None:
         for queue, horizon in ((self._frames, self.window), (self._visible, self.blink_window)):
             while queue and t - queue[0][0] > horizon:
                 queue.popleft()
-        while self._blinks and t - self._blinks[0] > self.blink_window:
-            self._blinks.popleft()
+        for queue in (self._blinks, self._long_blinks):
+            while queue and t - queue[0] > self.blink_window:
+                queue.popleft()

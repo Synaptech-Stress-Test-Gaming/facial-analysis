@@ -28,8 +28,8 @@ import pylsl
 import clock
 from face_features import CUE_NAMES, RAW_BLENDSHAPE_NAMES, FaceDetector, FeatureExtractor, ensure_model
 from pulse import PulseEstimator
-from stress_model import (LABELS, READABLE, BaselineScorer, FocusScorer, PersonalModel, Recorder, Smoother,
-                           focus_level, level, train)
+from stress_model import (LABELS, READABLE, BaselineScorer, EyeScorer, FocusScorer, PersonalModel, Recorder,
+                           Smoother, focus_level, level, train)
 
 HERE = Path(__file__).resolve().parent
 FACE_MODEL = HERE / "models" / "face_landmarker.task"
@@ -40,6 +40,8 @@ WINDOW = "Stress detector"
 RECORD_WARMUP = 10.0  # seconds before a recording starts, so blink rate and pulse have data
 HISTORY_SECONDS = 60
 LABEL_KEYS = {ord("0"): "none", ord("1"): "calm", ord("2"): "stressed", ord("3"): "focused", ord("4"): "distracted"}
+OFF_SCREEN_Z = 2.5                # a gaze z-score beyond this (vs. your calibration) counts as "looking away"
+OFF_SCREEN_WINDOW_SECONDS = 30.0  # window for the off-screen-time cue
 
 # OpenCV colors are (blue, green, red).
 GREEN, YELLOW, RED = (90, 200, 90), (0, 200, 255), (60, 60, 235)
@@ -67,6 +69,8 @@ class StressApp:
             self.smoother = Smoother(args.smoothing)
             self.focus_scorer = FocusScorer(args.calibration)
             self.focus_smoother = Smoother(args.smoothing)
+            self.eye_scorer = EyeScorer(args.calibration)
+            self._eye_seen, self._off_screen, self._last_eye_t = deque(), deque(), None
             if args.udp != "off":
                 self.udp = UdpSender(args.udp)
                 print(f"Sending stress values to udp://{args.udp}")
@@ -146,6 +150,11 @@ class StressApp:
                 self.focus = self.focus_smoother.update(t, fvalue)
             else:
                 self.focus_scorer.calibrate(t, self.feats)
+            if self.face is not None:  # only on frames with a real (not window-carried) measurement
+                if self.eye_scorer.ready:
+                    self._update_eye_tracking(t)
+                else:
+                    self.eye_scorer.calibrate(t, self.feats)
         if self.stress is not None:
             self.history.append((t, self.stress))
             while t - self.history[0][0] > HISTORY_SECONDS:
@@ -221,6 +230,22 @@ class StressApp:
             print(f"[{(self.t if t is None else t):6.1f}s] label -> {label}")
             self.label = label
 
+    def recalibrate(self) -> None:
+        """Restarts calibration for every baseline-based scorer. No-op with a personal model."""
+        if not isinstance(self.scorer, BaselineScorer):
+            return
+        self.scorer.restart()
+        self.smoother.reset()
+        self.stress, self.reasons = None, {}
+        self.history.clear()
+        self.focus_scorer.restart()
+        self.focus_smoother.reset()
+        self.focus = None
+        self.eye_scorer.restart()
+        self._eye_seen.clear()
+        self._off_screen.clear()
+        self._last_eye_t = None
+
     def start_recording(self, name: str) -> None:
         if self.label_recorder:
             self.label_recorder.close()
@@ -234,6 +259,49 @@ class StressApp:
         self.label_recorder = None
         return {"rows": rows, "path": None if rows == 0 else str(path)}
 
+    def _update_eye_tracking(self, t: float) -> None:
+        """Accumulates off-screen time: a gaze z-score (vs. your calibration) beyond
+        OFF_SCREEN_Z, over the last OFF_SCREEN_WINDOW_SECONDS.
+        """
+        dev = self.eye_scorer.deviations(self.feats)
+        off_screen = not math.isnan(dev["gaze_x"]) and (abs(dev["gaze_x"]) > OFF_SCREEN_Z
+                                                          or abs(dev["gaze_y"]) > OFF_SCREEN_Z)
+        if self._last_eye_t is not None and 0 < t - self._last_eye_t < 0.5:
+            dt = t - self._last_eye_t
+            self._eye_seen.append((t, dt))
+            if off_screen:
+                self._off_screen.append((t, dt))
+        self._last_eye_t = t
+        for q in (self._eye_seen, self._off_screen):
+            while q and t - q[0][0] > OFF_SCREEN_WINDOW_SECONDS:
+                q.popleft()
+
+    def off_screen_seconds(self) -> float:
+        return sum(dt for _, dt in self._off_screen)
+
+    def eye_cues(self) -> dict:
+        """Eye/gaze cues for the server: each relative to your calibration baseline,
+        except long_blink_count and off_screen_seconds, which are raw counts/durations
+        (off-screen detection itself is baseline-relative; see _update_eye_tracking).
+        """
+        if not self.eye_scorer.ready or self.feats is None:
+            return {"ready": False, "gaze_x": None, "gaze_y": None, "eye_wide": None,
+                    "blink_rate": None, "long_blink_count": None, "off_screen_seconds": None}
+
+        def num(x):
+            return None if x is None or math.isnan(x) else round(float(x), 3)
+
+        dev = self.eye_scorer.deviations(self.feats)
+        return {
+            "ready": True,
+            "gaze_x": num(dev["gaze_x"]),
+            "gaze_y": num(dev["gaze_y"]),
+            "eye_wide": num(dev["eye_wide"]),
+            "blink_rate": num(dev["blink_rate"]),
+            "long_blink_count": self.extractor.long_blink_count(self.t),
+            "off_screen_seconds": round(self.off_screen_seconds(), 1),
+        }
+
     # ---- window ---------------------------------------------------------------
 
     def show(self, frame: np.ndarray) -> bool:
@@ -246,10 +314,7 @@ class StressApp:
         if key == ord("d"):
             self.details = not self.details
         if key == ord("c") and isinstance(self.scorer, BaselineScorer):
-            self.scorer.restart()
-            self.smoother.reset()
-            self.stress, self.reasons = None, {}
-            self.history.clear()
+            self.recalibrate()
         if key in LABEL_KEYS:
             self.set_label(LABEL_KEYS[key])
         return True
