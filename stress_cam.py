@@ -23,6 +23,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from eye_tracking import EyeTracker
 from face_features import FaceDetector, FeatureExtractor, ensure_model
 from pulse import PulseEstimator
 from stress_model import LABELS, READABLE, BaselineScorer, PersonalModel, Recorder, Smoother, level, train
@@ -61,9 +62,18 @@ class StressApp:
                 print(f"Calibrating for {args.calibration:.0f} s: relax and look at the screen like you normally do.")
             self.smoother = Smoother(args.smoothing)
             if args.udp != "off":
-                self.udp = UdpSender(args.udp)
-                print(f"Sending stress values to udp://{args.udp}")
+                try:
+                    self.udp = UdpSender(args.udp)
+                except (OSError, ValueError, OverflowError) as exc:
+                    print(f"UDP disabled: {exc}", file=sys.stderr)
+                else:
+                    print(f"Sending stress values to udp://{args.udp}")
 
+        self.eye_tracker = None if self.recorder else EyeTracker(args.eye_calibration, args.attention_window)
+        self.eye_data = {}
+        self.timestamp = None
+        self.timings = deque(maxlen=600)
+        self.capture_failures = 0
         self.t, self.face, self.feats = 0.0, None, None
         self.stress, self.reasons = None, {}
         self.history = deque()
@@ -76,6 +86,11 @@ class StressApp:
         try:
             for t, frame in frames(self.args):
                 self.step(t, frame)
+                if frame is None:
+                    self.capture_failures += 1
+                    if self.done():
+                        break
+                    continue
                 now = time.perf_counter()
                 if last_frame is not None:
                     rate = 1.0 / max(now - last_frame, 1e-6)
@@ -85,7 +100,7 @@ class StressApp:
                     if t - last_print >= 1.0:
                         last_print = t
                         print(self.status())
-                elif not self.show(frame):
+                elif frame is not None and not self.show(frame):
                     break
                 if self.done():
                     break
@@ -93,6 +108,10 @@ class StressApp:
             pass
         finally:
             self.detector.close()
+            if self.udp:
+                self.udp.close()
+            if self.args.command == 'run' and self.args.profile:
+                self.print_profile()
             cv2.destroyAllWindows()
             if self.recorder:
                 self.recorder.close()
@@ -101,9 +120,32 @@ class StressApp:
                 else:
                     print("Nothing was recorded (no face seen after the warm-up).")
 
-    def step(self, t: float, frame: np.ndarray) -> None:
+    def step(self, t: float, frame: np.ndarray | None) -> None:
         self.t = t
-        self.face = self.detector.detect(frame, t)
+        self.timestamp = time.time()
+        start = time.perf_counter()
+        failure = frame is None
+        self.face = None
+        if frame is not None:
+            try:
+                self.face = self.detector.detect(frame, t)
+            except (RuntimeError, ValueError, cv2.error):
+                failure = True
+        if self.face is not None and not np.isfinite(self.face.points).all():
+            self.face, failure = None, True
+        detected = time.perf_counter()
+        if self.eye_tracker:
+            self.eye_data = self.eye_tracker.update(
+                t, self.face.points if self.face else None,
+                self.face.pose if self.face else None, failure,
+            )
+        eyes_done = time.perf_counter()
+        if frame is None:
+            self.extractor.update(t, frame, None)
+            self.feats = None
+            if self.udp:
+                self.udp.send(t, self.message())
+            return
         self.extractor.update(t, frame, self.face)
         self.feats = self.extractor.features(t)
 
@@ -121,8 +163,26 @@ class StressApp:
             self.history.append((t, self.stress))
             while t - self.history[0][0] > HISTORY_SECONDS:
                 self.history.popleft()
-        if self.udp:
+        scored = time.perf_counter()
+        if self.udp and self.udp.due(t):
             self.udp.send(t, self.message())
+        if self.args.profile:
+            finished = time.perf_counter()
+            self.timings.append((t, detected - start, eyes_done - detected,
+                                 scored - eyes_done, finished - scored, finished - start))
+
+    def print_profile(self) -> None:
+        print(f"Failed camera reads: {self.capture_failures}")
+        if not self.timings:
+            return
+        values = np.asarray(self.timings)
+        if len(values) > 1:
+            span = values[-1, 0] - values[0, 0]
+            if span:
+                print(f"Frames per source second: {(len(values) - 1) / span:.1f}; loop FPS: {self.fps:.1f}")
+        for name, column in zip(("landmarker", "eyes", "legacy", "publish", "step"), values[:, 1:].T):
+            p50, p95 = np.percentile(column * 1000, (50, 95))
+            print(f"{name:12s} p50 {p50:6.2f} ms  p95 {p95:6.2f} ms")
 
     def done(self) -> bool:
         if self.recorder and self.t >= RECORD_WARMUP + self.args.seconds:
@@ -133,16 +193,33 @@ class StressApp:
         """What the game receives, up to 20 times per second."""
         def number(name):
             value = self.feats[name] if self.feats else math.nan
-            return None if math.isnan(value) else round(value, 1)
+            return None if not math.isfinite(value) else round(value, 1)
 
+        stress = self.stress if self.stress is not None and math.isfinite(self.stress) else None
         return {
-            "stress": None if self.stress is None else round(self.stress, 3),
-            "level": None if self.stress is None else level(self.stress),
+            "stress": None if stress is None else round(stress, 3),
+            "level": None if stress is None else level(stress),
             "face": self.face is not None,
             "calibrating": not self.scorer.ready,
             "heart_rate": number("heart_rate"),
             "blink_rate": number("blink_rate"),
             "time": round(self.t, 2),
+            "schema_version": 2,
+            "timestamp": self.timestamp,
+            "fps": round(self.fps, 1),
+            "stress_analysis": {
+                "score": None, "confidence": None, "method": "unvalidated",
+                "legacy_method": self.scorer.name,
+                "legacy_contributions": {
+                    name: value if math.isfinite(value) else None
+                    for name, value in self.reasons.items() if self.face is not None and self.feats
+                },
+                "behavioral_features": {
+                    name: value if math.isfinite(value) else None
+                    for name, value in (self.feats or {}).items() if self.face is not None
+                },
+            },
+            **self.eye_data,
         }
 
     def top_reasons(self, n: int = 2) -> list[str]:
@@ -175,6 +252,8 @@ class StressApp:
             return False
         if key == ord("d"):
             self.details = not self.details
+        if key == ord("c") and self.eye_tracker:
+            self.eye_tracker.reset()
         if key == ord("c") and isinstance(self.scorer, BaselineScorer):
             self.scorer.restart()
             self.smoother.reset()
@@ -202,7 +281,7 @@ class StressApp:
             put(img, "relax, look at the screen", (12, 58))
             bar(img, 12, 70, 246, self.scorer.progress(self.t), YELLOW)
         elif self.stress is not None:
-            put(img, f"STRESS {self.stress:4.0%}", (12, 32), 0.8, color, 2)
+            put(img, f"LEGACY {self.stress:4.0%}", (12, 32), 0.8, color, 2)
             bar(img, 12, 44, 246, self.stress, color)
             put(img, level(self.stress).upper(), (12, 82), 0.6, color, 2)
             put(img, ", ".join(self.top_reasons()), (12, 104), 0.45)
@@ -214,12 +293,47 @@ class StressApp:
 
         mode = "recording" if self.recorder else self.scorer.name
         put_right(img, f"{mode} | {self.fps:.0f} fps", 20)
-        keys = "q quit  d details" + ("  c recalibrate" if isinstance(self.scorer, BaselineScorer) else "")
+        if self.eye_data:
+            self._draw_eyes(img, 52)
+        keys = "q quit  d details" + ("  c recalibrate" if self.eye_tracker else "")
         put_right(img, keys, 40)
         if self.details:
             self._draw_details(img)
         if not self.recorder:
             self._draw_history(img)
+
+    def _draw_eyes(self, img: np.ndarray, top: int) -> None:
+        data = self.eye_data
+        gaze = data["gaze"]
+        progress = data["eye_calibration_progress"]
+        right = img.shape[1] - (208 if self.details else 10)
+        left = max(0, right - 156)
+        shade(img, left, top, right, min(img.shape[0], top + 144), 0.7)
+        if progress < 1:
+            put(img, f"Look center {progress:.0%}", (left + 6, top + 19), 0.42)
+            return
+
+        direction = gaze["direction"] or data["tracking_state"].replace("_", " ")
+        put(img, f"Eyes: {direction}", (left + 6, top + 19), 0.43)
+        center = (left + 32, top + 53)
+        cv2.rectangle(img, (center[0] - 24, center[1] - 24),
+                      (center[0] + 24, center[1] + 24), GRAY, 1)
+        cv2.line(img, (center[0] - 24, center[1]), (center[0] + 24, center[1]), GRAY)
+        cv2.line(img, (center[0], center[1] - 24), (center[0], center[1] + 24), GRAY)
+        dx, dy = gaze["center_offset_x"], gaze["center_offset_y"]
+        if dx is not None and dy is not None:
+            x = center[0] + int(np.clip(dx * 180, -23, 23))
+            y = center[1] + int(np.clip(dy * 180, -23, 23))
+            cv2.circle(img, (x, y), 4, GREEN, -1)
+            put(img, f"x {dx:+.3f}", (left + 64, top + 47), 0.39)
+            put(img, f"y {dy:+.3f}", (left + 64, top + 65), 0.39)
+
+        pose = data["head_pose"]
+        if pose is not None:
+            put(img, f"Head yaw {pose['yaw_deg']:+.0f} deg", (left + 6, top + 98), 0.4)
+        score = data["attention"]["score"]
+        if score is not None:
+            put(img, f"Center time {score:.0%}", (left + 6, top + 120), 0.4)
 
     def _draw_recording(self, img: np.ndarray) -> None:
         label = self.recorder.label
@@ -262,16 +376,23 @@ class UdpSender:
 
     def __init__(self, address: str, rate: float = 20.0):
         host, port = address.rsplit(":", 1)
-        self.target = (host, int(port))
         self.interval, self._last = 1.0 / rate, -math.inf
+        self.target = socket.getaddrinfo(host, int(port), socket.AF_INET, socket.SOCK_DGRAM)[0][4]
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setblocking(False)
+
+    def close(self) -> None:
+        self._sock.close()
+
+    def due(self, t: float) -> bool:
+        return t - self._last >= self.interval
 
     def send(self, t: float, message: dict) -> None:
-        if t - self._last < self.interval:
+        if not self.due(t):
             return
         self._last = t
         try:
-            self._sock.sendto(json.dumps(message).encode(), self.target)
+            self._sock.sendto(json.dumps(message, allow_nan=False).encode(), self.target)
         except OSError:
             pass  # nobody is listening yet; that's fine
 
@@ -295,6 +416,7 @@ def frames(args: argparse.Namespace):
                 failures += 1
                 if failures > 50:
                     raise SystemExit("The webcam stopped sending frames.")
+                yield time.monotonic() - start, None
                 time.sleep(0.02)
                 continue
             failures = 0
@@ -359,6 +481,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     live.add_argument("--sensitivity", type=float, default=0.4, help="how strongly the baseline score reacts (default 0.4)")
     live.add_argument("--smoothing", type=float, default=1.0, help="seconds of smoothing on the output (default 1)")
     live.add_argument("--udp", default="127.0.0.1:5005", help="host:port to send stress values to, or 'off'")
+    live.add_argument("--eye-calibration", type=float, default=3.0)
+    live.add_argument("--attention-window", type=float, default=3.0)
+    live.add_argument("--profile", action="store_true", help="print processing latency at shutdown")
     record = commands.add_parser("record", parents=[common], help="record a labeled session for training")
     record.add_argument("label", choices=LABELS)
     record.add_argument("--seconds", type=float, default=120.0, help="length of the recording (default 120)")
@@ -366,7 +491,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     if not argv or argv[0] not in ("run", "record", "train", "-h", "--help"):
         argv = ["run", *argv]
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.command == "run":
+        for name in ("eye_calibration", "attention_window", "calibration"):
+            if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+                parser.error(f"--{name.replace('_', '-')} must be finite and positive")
+        for name in ("sensitivity", "smoothing"):
+            if not math.isfinite(getattr(args, name)):
+                parser.error(f"--{name} must be finite")
+    return args
 
 
 def main() -> None:
