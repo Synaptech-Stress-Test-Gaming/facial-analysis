@@ -26,8 +26,9 @@ import cv2
 import numpy as np
 import pylsl
 
+import clock
 from eye_tracking import EyeTracker
-from face_features import FaceDetector, FeatureExtractor, ensure_model
+from face_features import CUE_NAMES, RAW_BLENDSHAPE_NAMES, FaceDetector, FeatureExtractor, ensure_model
 from pulse import PulseEstimator
 from stress_model import (LABELS, READABLE, BaselineScorer, EyeScorer, FocusScorer, PersonalModel, Recorder,
                            Smoother, focus_level, level, train)
@@ -79,13 +80,17 @@ class StressApp:
                     print(f"UDP disabled: {exc}", file=sys.stderr)
                 else:
                     print(f"Sending stress values to udp://{args.udp}")
+            try:
+                self.lsl_outlet = StressOutlet()
+            except Exception as exc:  # LSL is optional; never block the live app on it
+                print(f"LSL outlet disabled: {exc}", file=sys.stderr)
 
         self.eye_tracker = None if self.recorder else EyeTracker(args.eye_calibration, args.attention_window)
         self.eye_data = {}
         self.timestamp = None
         self.timings = deque(maxlen=600)
         self.capture_failures = 0
-        self.t, self.face, self.feats = 0.0, None, None
+        self.t, self.frame_id, self.t_capture, self.face, self.feats = 0.0, None, None, None, None
         self.stress, self.reasons = None, {}
         self.focus = None
         self.label = "none"
@@ -103,8 +108,8 @@ class StressApp:
             cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
         last_frame, last_print, last_cue_print = None, -math.inf, -math.inf
         try:
-            for t, frame in frames(self.args):
-                self.step(t, frame)
+            for t, frame_id, frame, t_capture in frames(self.args):
+                self.step(t, frame, frame_id, t_capture)
                 if frame is None:
                     self.capture_failures += 1
                     if self.done():
@@ -148,8 +153,10 @@ class StressApp:
                 else:
                     print("Nothing was recorded (no frames were captured).")
 
-    def step(self, t: float, frame: np.ndarray | None) -> None:
-        self.t = t
+    def step(self, t: float, frame: np.ndarray | None, frame_id: int | None = None,
+             t_capture: float | None = None) -> None:
+        self.t, self.frame_id = t, frame_id
+        self.t_capture = clock.now() if t_capture is None else t_capture
         self.timestamp = time.time()
         start = time.perf_counter()
         failure = frame is None
@@ -201,6 +208,11 @@ class StressApp:
             self.history.append((t, self.stress))
             while t - self.history[0][0] > HISTORY_SECONDS:
                 self.history.popleft()
+        if self.label_recorder:
+            self.label_recorder.write(self.t_capture, frame_id, self.face, self.stress, self.focus,
+                                      self.feats, self.label)
+        if self.lsl_outlet:
+            self.lsl_outlet.push(self.t_capture, self.stress, self.focus)
         scored = time.perf_counter()
         if self.udp and self.udp.due(t):
             self.udp.send(t, self.message())
@@ -244,6 +256,8 @@ class StressApp:
             "blink_rate": number("blink_rate"),
             **{name: number(name) for name in CUE_NAMES},
             "time": round(self.t, 2),
+            "t_capture": None if self.t_capture is None else round(self.t_capture, 6),
+            "frame_id": self.frame_id,
             "schema_version": 2,
             "timestamp": self.timestamp,
             "fps": round(self.fps, 1),
@@ -618,7 +632,7 @@ def frames(args: argparse.Namespace):
                 failures += 1
                 if failures > 50:
                     raise SystemExit("The webcam stopped sending frames.")
-                yield time.monotonic() - start, None
+                yield t_capture - start, None, None, t_capture
                 time.sleep(0.02)
                 continue
             failures = 0
