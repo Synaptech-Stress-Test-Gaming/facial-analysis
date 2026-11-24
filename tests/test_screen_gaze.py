@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import unittest
 
@@ -46,6 +47,7 @@ def calibrate(tracker, rng, t=0.0, face=fake_face):
         settled, _ = cal.progress(t)
         gx, gy = cal.targets[cal.current] if settled >= 0.5 else (0.5, 0.5)
         tracker.step(t, frame, face(gx, gy, rng, blink=rng.random() < 0.05) if face else None)
+        json.dumps(tracker.message(t), allow_nan=False)  # what UdpSender sends
     return t
 
 
@@ -61,6 +63,7 @@ class ScreenGazeTest(unittest.TestCase):
         for _ in range(frames):
             self.__class__.t += 1 / 30
             self.tracker.step(self.t, self.frame, fake_face(gx, gy, self.rng, **kwargs))
+            json.dumps(self.tracker.message(self.t), allow_nan=False)  # what UdpSender sends
 
     def test_features_follow_the_eyes(self):
         rng = np.random.default_rng(0)

@@ -98,7 +98,8 @@ def head_moved(now: np.ndarray, ref: np.ndarray) -> bool:
     turned = max(abs((a - b + 180) % 360 - 180) for a, b in zip(now[:2], ref[:2]))
     shift = float(np.linalg.norm(now[2:4] - ref[2:4])) / ref[4]
     scale = abs(now[4] / ref[4] - 1)
-    return turned > HEAD_MOVED_DEGREES or shift > HEAD_MOVED_SHIFT or scale > HEAD_MOVED_SCALE
+    # bool(): comparisons of numpy numbers give numpy.bool_, which json can't encode
+    return bool(turned > HEAD_MOVED_DEGREES or shift > HEAD_MOVED_SHIFT or scale > HEAD_MOVED_SCALE)
 
 
 def calibration_targets(n: int, margin: float = 0.07) -> list[tuple[float, float]]:
