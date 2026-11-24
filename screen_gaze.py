@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import math
 import os
 import sys
 import time
@@ -45,6 +44,7 @@ from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 
 from eye_tracking import EYES, measure
 from face_features import Face, FaceDetector, ensure_model
+from one_euro import OneEuroFilter
 from stress_cam import FACE_MODEL, UdpSender, open_camera
 
 WINDOW = "Screen gaze"
@@ -214,34 +214,6 @@ class GazeModel:
     @staticmethod
     def _make(degree: int, alpha: float):
         return make_pipeline(StandardScaler(), PolynomialFeatures(degree, include_bias=False), Ridge(alpha=alpha))
-
-
-class OneEuroFilter:
-    """Smooths the gaze point: strongly while you hold your gaze (hides the jitter), hardly
-    at all while your eyes jump (no lag). Casiez et al., "1 Euro Filter", CHI 2012."""
-
-    def __init__(self, min_cutoff: float = 1.0, beta: float = 0.004, d_cutoff: float = 1.0):
-        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
-        self.reset()
-
-    def reset(self) -> None:
-        self._t = self._x = None
-        self._dx = 0.0
-
-    @staticmethod
-    def _alpha(dt: float, cutoff: float) -> float:
-        return 1.0 / (1.0 + 1.0 / (2 * math.pi * cutoff * dt))
-
-    def __call__(self, t: float, x: np.ndarray) -> np.ndarray:
-        if self._t is None or t - self._t > 0.5:  # first point, or after a long gap: start over
-            self._t, self._x, self._dx = t, x.astype(float), np.zeros_like(x, dtype=float)
-            return self._x
-        dt = max(t - self._t, 1e-3)
-        a = self._alpha(dt, self.d_cutoff)
-        self._dx = a * (x - self._x) / dt + (1 - a) * self._dx
-        a = self._alpha(dt, self.min_cutoff + self.beta * float(np.linalg.norm(self._dx)))
-        self._t, self._x = t, a * x + (1 - a) * self._x
-        return self._x
 
 
 class ScreenGazeTracker:
