@@ -5,3 +5,4 @@ numpy
 pylsl                # shared clock + StreamOutlet, so recordings line up with the Muse 2 EEG
 fastapi              # server.py: HTTP/WebSocket metrics server, alongside the UDP output
 uvicorn              # ASGI server for server.py
+brainflow            # Muse 2 EEG over Bluetooth (muse_eeg.py)
