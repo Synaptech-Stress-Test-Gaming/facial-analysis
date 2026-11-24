@@ -16,8 +16,10 @@ import csv
 import json
 import math
 import os
+import queue
 import socket
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -30,6 +32,7 @@ import pylsl
 import clock
 from eye_tracking import EyeTracker
 from face_features import CUE_NAMES, RAW_BLENDSHAPE_NAMES, FaceDetector, FeatureExtractor, ensure_model
+from head_movement import HeadMovement
 from pulse import PulseEstimator
 from stress_model import (LABELS, READABLE, BaselineScorer, EyeScorer, FocusScorer, PersonalModel, Recorder,
                            Smoother, focus_level, level, train)
@@ -68,7 +71,7 @@ class StressApp:
                 print("Using your personal model (add --baseline to calibrate instead).")
             else:
                 self.scorer = BaselineScorer(args.calibration, args.sensitivity)
-                print(f"Calibrating for {args.calibration:.0f} s: relax and look at the screen like you normally do.")
+                print(f"Calibrating for {args.calibration:.0f} s: relax, sit the way you normally do and look at the screen.")
             self.smoother = Smoother(args.smoothing)
             self.focus_scorer = FocusScorer(args.calibration)
             self.focus_smoother = Smoother(args.smoothing)
@@ -88,6 +91,12 @@ class StressApp:
 
         self.eye_tracker = None if self.recorder else EyeTracker(args.eye_calibration, args.attention_window)
         self.eye_data = {}
+        self.head_movement = None if self.recorder else HeadMovement(args.head_calibration or args.calibration)
+        self.head_data = {}
+        self.json_log = None
+        if not self.recorder and getattr(args, "save_json", False):
+            self.json_log = JsonLog(RECORDINGS, "live")
+            print(f"Saving every frame to {self.json_log.path}")
         self.timestamp = None
         self.timings = deque(maxlen=600)
         self.capture_failures = 0
@@ -153,6 +162,10 @@ class StressApp:
                     print(f"Saved {self.label_recorder.rows} rows to {self.label_recorder.path}")
                 else:
                     print("Nothing was recorded (no frames were captured).")
+            if self.json_log:
+                self.json_log.close()
+                print(f"Saved {self.json_log.rows} frames to {self.json_log.path}" if self.json_log.rows
+                      else "No frames were saved to JSON.")
 
     def step(self, t: float, frame: np.ndarray | None, frame_id: int | None = None,
              t_capture: float | None = None) -> None:
@@ -175,6 +188,8 @@ class StressApp:
                 t, self.face.points if self.face else None,
                 self.face.pose if self.face else None, failure,
             )
+        if self.head_movement:
+            self.head_data = self.head_movement.update(t, self.face)
         eyes_done = time.perf_counter()
         if frame is None:
             self.extractor.update(t, frame, None)
@@ -215,8 +230,13 @@ class StressApp:
         if self.lsl_outlet:
             self.lsl_outlet.push(self.t_capture, self.stress, self.focus)
         scored = time.perf_counter()
-        if self.udp and self.udp.due(t):
-            self.udp.send(t, self.message())
+        send = self.udp is not None and self.udp.due(t)
+        if send or self.json_log:
+            message = self.message()
+            if send:
+                self.udp.send(t, message)
+            if self.json_log:  # only queues it; a background thread writes the file
+                self.json_log.write(message, self.face)
         if self.args.profile:
             finished = time.perf_counter()
             self.timings.append((t, detected - start, eyes_done - detected,
@@ -275,6 +295,7 @@ class StressApp:
                 },
             },
             **self.eye_data,
+            "head_movement": self.head_data or None,
         }
 
     def top_reasons(self, n: int = 2) -> list[str]:
@@ -315,7 +336,10 @@ class StressApp:
             self.label = label
 
     def recalibrate(self) -> None:
-        """Restarts calibration for every baseline-based scorer. No-op with a personal model."""
+        """Restarts calibration for every baseline-based scorer and the head's normal posture.
+        The scorers are left alone with a personal model."""
+        if self.head_movement:
+            self.head_movement.reset()
         if not isinstance(self.scorer, BaselineScorer):
             return
         self.scorer.restart()
@@ -399,6 +423,8 @@ class StressApp:
             self.details = not self.details
         if key == ord("c") and self.eye_tracker:
             self.eye_tracker.reset()
+        if key == ord("c") and self.head_movement:
+            self.head_movement.reset()
         if key == ord("c") and isinstance(self.scorer, BaselineScorer):
             self.recalibrate()
         if key in LABEL_KEYS:
@@ -422,7 +448,7 @@ class StressApp:
             self._draw_recording(img)
         elif not self.scorer.ready:
             put(img, "Calibrating...", (12, 32), 0.8, YELLOW, 2)
-            put(img, "relax, look at the screen", (12, 58))
+            put(img, "relax, sit normally, look ahead", (12, 58), 0.47)
             bar(img, 12, 70, 246, self.scorer.progress(self.t), YELLOW)
         elif self.stress is not None:
             put(img, f"LEGACY {self.stress:4.0%}", (12, 32), 0.8, color, 2)
@@ -441,12 +467,32 @@ class StressApp:
         put_right(img, f"{mode} | {self.fps:.0f} fps", 20)
         if self.eye_data:
             self._draw_eyes(img, 52)
+        if self.head_data:
+            self._draw_head(img, 52 + (150 if self.eye_data else 0))
         keys = "q quit  d details" + ("  c recalibrate" if self.eye_tracker else "")
         put_right(img, keys, 40)
         if self.details:
             self._draw_details(img)
         if not self.recorder:
             self._draw_history(img)
+
+    def _draw_head(self, img: np.ndarray, top: int) -> None:
+        data = self.head_data
+        right = img.shape[1] - (208 if self.details else 10)
+        left = max(0, right - 156)
+        shade(img, left, top, right, min(img.shape[0], top + 96), 0.7)
+        if not data["calibrated"]:
+            put(img, f"Head: hold still {data['calibration_progress']:.0%}", (left + 6, top + 19), 0.42)
+            return
+        put(img, "Head", (left + 6, top + 19), 0.43)
+        for i, name in enumerate(("tilt", "nod", "turn", "lean")):
+            entry, y = data[name], top + 38 + 17 * i
+            if entry is None:
+                put(img, f"{name}  --", (left + 6, y), 0.39, GRAY)
+                continue
+            value = f"{round(entry['degrees']):+d} deg" if "degrees" in entry else f"{round(entry['cm']):+d} cm"
+            color = GRAY if entry["state"] == "none" else YELLOW
+            put(img, f"{name:<5} {entry['state']:<8} {value}", (left + 6, y), 0.39, color)
 
     def _draw_eyes(self, img: np.ndarray, top: int) -> None:
         data = self.eye_data
@@ -565,6 +611,41 @@ class StressOutlet:
         s = math.nan if stress is None else stress
         f = math.nan if focus is None else focus
         self._outlet.push_sample([s, f], timestamp=t_capture)
+
+
+class JsonLog:
+    """Saves every frame's message, plus MediaPipe's raw blendshape scores, as one JSON object
+    per line (JSON Lines) for analysis later. The camera loop only puts the message on a
+    queue; a background thread encodes and writes it, so saving doesn't delay the game.
+    """
+
+    def __init__(self, folder: Path, name: str):
+        folder.mkdir(parents=True, exist_ok=True)
+        self.path = folder / f"{name}_{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+        self.rows = 0
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._write_all, name="json-log", daemon=True)
+        self._thread.start()
+
+    def write(self, message: dict, face) -> None:
+        blendshapes = {k: round(v, 4) for k, v in face.blendshapes.items()} if face is not None else None
+        self._queue.put({**message, "blendshapes": blendshapes})
+        self.rows += 1
+
+    def close(self) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout=10)
+        if self.rows == 0 and self.path.exists():
+            self.path.unlink()
+
+    def _write_all(self) -> None:
+        with open(self.path, "w", encoding="utf-8") as file:
+            while (record := self._queue.get()) is not None:
+                try:
+                    line = json.dumps(record, allow_nan=False, separators=(",", ":"))
+                except (TypeError, ValueError):  # never lose the rest of the file over one odd value
+                    line = json.dumps(record, separators=(",", ":"), default=str)
+                file.write(line + "\n")
 
 
 class LabelRecorder:
@@ -701,6 +782,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     live.add_argument("--udp", default="127.0.0.1:5005", help="host:port to send stress values to, or 'off'")
     live.add_argument("--eye-calibration", type=float, default=3.0)
     live.add_argument("--attention-window", type=float, default=3.0)
+    live.add_argument("--head-calibration", type=float, default=None,
+                      help="seconds of still, neutral posture that head tilt, nod, turn and lean are measured "
+                           "from (default: the same as --calibration)")
+    live.add_argument("--save-json", action="store_true",
+                      help="also save every frame's values to recordings/ as JSON lines (written in the background)")
     live.add_argument("--profile", action="store_true", help="print processing latency at shutdown")
     record = commands.add_parser("record", parents=[common], help="record a labeled session for training")
     record.add_argument("label", choices=LABELS)
@@ -711,7 +797,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         argv = ["run", *argv]
     args = parser.parse_args(argv)
     if args.command == "run":
-        for name in ("eye_calibration", "attention_window", "calibration"):
+        for name in ("eye_calibration", "attention_window", "calibration", "head_calibration"):
+            if name == "head_calibration" and args.head_calibration is None:
+                continue
             if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
                 parser.error(f"--{name.replace('_', '-')} must be finite and positive")
         for name in ("sensitivity", "smoothing"):
