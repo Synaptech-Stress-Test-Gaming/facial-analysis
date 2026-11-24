@@ -29,3 +29,18 @@ Use `tracking_valid` with `attention.score` when a game interaction needs center
 ## Browser clients
 
 Browser JavaScript needs a bridge for raw UDP. A local process can receive the existing datagrams and forward the latest packet as JSON over a loopback WebSocket. Keep origin checks in the bridge, bind to loopback, and verify the deployed game's secure-context requirements. This release ships the UDP publisher and native receiver example.
+
+## Screen gaze (port 5007)
+
+`screen_gaze.py` is a separate program that sends JSON datagrams to `127.0.0.1:5007` at up to 30 Hz (`--udp HOST:PORT` or `--udp off`). Its gaze object uses the field names reserved above, filled after a dot calibration across the screen.
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version`, `source` | 2 and `"screen_gaze"`. |
+| `timestamp`, `time`, `t_emit` | Unix wall-clock seconds at frame acquisition, monotonic session seconds, and the shared clock at send time, as on port 5005. |
+| `face`, `calibrated` | Face detected in this frame; dot calibration finished. |
+| `calibration_error_px` | Mean error on left-out calibration dots, in screen pixels. Null before calibration. |
+| `head_moved` | The head turned more than 8°, moved sideways more than about a third of a face width, or leaned in or out by 15% since calibration. Accuracy drops; recalibrate. |
+| `screen` | `[width, height]` of the screen in pixels used for calibration. |
+| `gaze.screen_x`, `screen_y` | Gaze point as a fraction of the screen, 0–1 from the top left, smoothed and clipped to the screen. Held through blinks. Null until calibrated. |
+| `gaze.on_screen` | False when the unclipped estimate lies more than 5% outside the screen. |
