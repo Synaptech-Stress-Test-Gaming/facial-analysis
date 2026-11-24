@@ -21,6 +21,7 @@ Live mode sends UTF-8 JSON datagrams to IPv4 UDP `127.0.0.1:5005` at up to 20 Hz
 | `eyes.ear`, `closure_seconds` | Mean eye aspect ratio and elapsed seconds in the current closure. Null closure duration for open or unavailable eyes. |
 | `eyes.blink_rate_per_minute` | EAR-based completed blinks per minute of observed time across the last 30 s. Requires at least 10 s of observed time. |
 | `head_pose` | Relative-to-camera MediaPipe transform decomposition, in degrees around X, Y, Z (pitch, yaw, roll). Orientation is approximate and depends on image mirroring. |
+| `head_movement` | Head tilt, nod, turn and lean relative to the player's calibrated normal posture, for use as game input. See [Head movement](#head-movement). Null in record mode. |
 | `attention.score`, `coverage` | Center-oriented duration / usable duration in the window, and usable duration / window duration. Coverage measures availability. The score requires current valid tracking and at least 50% coverage. |
 | `stress_analysis` | Scientific stress score/confidence are null and method is `unvalidated`. Includes the legacy method, its contributions, and the rolling facial and behavioral features when available. |
 
@@ -44,3 +45,23 @@ Browser JavaScript needs a bridge for raw UDP. A local process can receive the e
 | `screen` | `[width, height]` of the screen in pixels used for calibration. |
 | `gaze.screen_x`, `screen_y` | Gaze point as a fraction of the screen, 0–1 from the top left, smoothed and clipped to the screen. Held through blinks. Null until calibrated. |
 | `gaze.on_screen` | False when the unclipped estimate lies more than 5% outside the screen. |
+
+## Head movement
+
+`head_movement` in every port 5005 message, measured from the player's neutral posture so that sitting normally reads 0. The neutral posture is learned during the same calibration as the legacy stress baseline (`--calibration`, 20 s by default; `--head-calibration` sets its own length): the first second is skipped while the camera and the player settle, only frames where the head turns slower than 15°/s count, and the neutral posture is their median. **c** or the server's calibrate command restarts it.
+
+| Field | Meaning |
+| --- | --- |
+| `calibrated`, `calibration_progress` | Normal posture learned; fraction of the calibration collected, 0–1. |
+| `tilt`, `nod`, `turn` | Each `{"degrees", "amount", "state"}`, or null without a face or before calibration. |
+| `lean` | `{"fraction", "cm", "amount", "state"}`: distance change as a fraction of the calibrated distance and in approximate cm, or null. |
+| `degrees` | Rotation since the neutral posture, about the head's own axes, so a turn doesn't register as tilt when the camera is above or beside the screen. Tilt: ear toward a shoulder, negative left. Nod: negative down. Turn: negative left. |
+| `fraction`, `cm` | Positive when closer to the screen than the neutral posture. |
+| `amount` | The change scaled to -1..1 and clipped: ±30° tilt, ±25° nod, ±35° turn, ±25% lean reach ±1. |
+| `state` | `left`/`right` (tilt, turn), `up`/`down` (nod), `forward`/`back` (lean), or `none`. It switches on beyond 12° tilt, 12° nod, 15° turn or 10% lean, and off below 8°, 8°, 10° and 6%, so it doesn't flicker at the threshold. |
+
+Left and right are from the player's point of view in the mirrored webcam image and swap for `--video` input. Values are smoothed with a 1 Euro filter; a quick 25° tilt changes `state` within two frames.
+
+## Saving every frame (`--save-json`)
+
+`python stress_cam.py --save-json` also writes every frame's message, not only the 20 Hz UDP ones, to `recordings/live_<date>-<time>.jsonl`: one JSON object per line, with MediaPipe's 52 raw blendshape scores added as `blendshapes`. A background thread encodes and writes the file, adding about 0.1 ms per frame to the camera loop. Expect about 5 MB per minute. Load it with `pandas.read_json(path, lines=True)`.

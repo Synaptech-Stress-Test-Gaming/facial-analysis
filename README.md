@@ -25,7 +25,7 @@ python game_receiver_example.py
 python -m unittest discover -s tests -v
 ```
 
-Default UDP destination is `127.0.0.1:5005`. `--eye-calibration` and `--attention-window` accept durations in seconds. The calibrated gaze reference is a center target. Display coordinates and screen-presence classification are unavailable. Camera frames stay local.
+Head tilt, nod, turn and lean are measured from the neutral posture learned during the 20-second calibration, so sitting normally reads 0, and are sent as `head_movement` for use as game input; see the [API](docs/api.md#head-movement). Add `--save-json` to also save every frame's values to `recordings/` as JSON lines for later analysis. Default UDP destination is `127.0.0.1:5005`. `--eye-calibration` and `--attention-window` accept durations in seconds. The calibrated gaze reference is a center target. Display coordinates and screen-presence classification are unavailable. Camera frames stay local.
 
 ## Existing personal model
 

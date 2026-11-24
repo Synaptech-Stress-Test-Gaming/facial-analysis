@@ -166,6 +166,7 @@ class Face:
     blendshapes: dict   # blendshape name -> score between 0 and 1
 
     pose: tuple[float, float, float] | None = None
+    transform: np.ndarray | None = None  # MediaPipe's 4x4 head pose: rotation, translation in cm
 
     @property
     def width(self) -> float:
@@ -215,12 +216,13 @@ class FaceDetector:
         points = np.array([(p.x * w, p.y * h) for p in result.face_landmarks[0]], dtype=np.float32)
         blendshapes = {c.category_name: c.score for c in result.face_blendshapes[0]}
         matrices = result.facial_transformation_matrixes
-        pose = None
+        pose = transform = None
         if len(matrices) and np.isfinite(matrices[0]).all():
             angles = cv2.RQDecomp3x3(np.asarray(matrices[0][:3, :3], dtype=np.float64))[0]
             if all(math.isfinite(angle) for angle in angles):
                 pose = tuple(map(float, angles))
-        return Face(points, blendshapes, pose)
+            transform = np.asarray(matrices[0], dtype=np.float64)
+        return Face(points, blendshapes, pose, transform)
 
     def close(self) -> None:
         self._landmarker.close()
